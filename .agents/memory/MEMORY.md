@@ -1,1 +1,2 @@
 - [Migration boundaries](migration-boundaries.md) — preserve the imported Python backend and original design; the empty database scaffold is not authoritative.
+- [HTTP proxy encoding](http-proxy-encoding.md) — preserve compressed bytes and Content-Encoding together; successful health checks do not prove browser scripts can execute.

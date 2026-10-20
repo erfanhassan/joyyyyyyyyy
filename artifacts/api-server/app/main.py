@@ -168,12 +168,18 @@ async def clerk_frontend_api_proxy(request: Request, path: str = ""):
 
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
-            upstream = await client.request(
+            async with client.stream(
                 request.method,
                 upstream_url,
                 headers=headers,
                 content=await request.body(),
-            )
+            ) as upstream:
+                # Preserve the wire bytes and Content-Encoding together. httpx
+                # cannot decode every encoding a browser may request (e.g. br
+                # or zstd); stripping that header corrupts Clerk's JavaScript.
+                upstream_body = b"".join(
+                    [chunk async for chunk in upstream.aiter_raw()]
+                )
     except httpx.HTTPError as exc:
         logger.warning("Clerk frontend proxy failed (%s)", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Sign-in service is unavailable.") from None
@@ -187,7 +193,6 @@ async def clerk_frontend_api_proxy(request: Request, path: str = ""):
         "trailers",
         "transfer-encoding",
         "upgrade",
-        "content-encoding",
         "content-length",
     }
     response_headers = {
@@ -196,12 +201,15 @@ async def clerk_frontend_api_proxy(request: Request, path: str = ""):
         if key.lower() not in hop_headers and key.lower() != "set-cookie"
     }
     response = Response(
-        content=upstream.content,
+        content=upstream_body,
         status_code=upstream.status_code,
         headers=response_headers,
     )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+    if request.method == "HEAD" or upstream.status_code == 304:
+        if "content-length" in upstream.headers:
+            response.headers["content-length"] = upstream.headers["content-length"]
     return response
 
 

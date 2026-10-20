@@ -8,6 +8,7 @@ import {
   Code2,
   CheckCircle2,
   AlertCircle,
+  Info,
   Copy,
   Check,
   Shield,
@@ -26,6 +27,7 @@ import {
   PhoneForwarded
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
+import { IntegrationDiagnostic } from "@/components/integration-diagnostic";
 
 interface IntegrationRecord {
   id: string;
@@ -52,8 +54,8 @@ export default function IntegrationHubPage() {
   // Meta Form Inputs & OAuth
   const [metaTab, setMetaTab] = useState<"oauth" | "manual">("oauth");
   const [metaPageName, setMetaPageName] = useState("Official Storefront");
-  const [metaPageId, setMetaPageId] = useState("102938475620192");
-  const [metaIgId, setMetaIgId] = useState("17841400012345678");
+  const [metaPageId, setMetaPageId] = useState("");
+  const [metaIgId, setMetaIgId] = useState("");
   const [metaToken, setMetaToken] = useState("");
   const [userAccessTokenInput, setUserAccessTokenInput] = useState("");
   const [metaDiscoveredPages, setMetaDiscoveredPages] = useState<Array<{
@@ -68,12 +70,12 @@ export default function IntegrationHubPage() {
   const [metaAppId, setMetaAppId] = useState("");
 
   // Shopify Form Inputs
-  const [shopifyDomain, setShopifyDomain] = useState("luxury-store.myshopify.com");
+  const [shopifyDomain, setShopifyDomain] = useState("");
   const [shopifyToken, setShopifyToken] = useState("");
-  const [shopifySecret, setShopifySecret] = useState("shpss_sec_991823");
+  const [shopifySecret, setShopifySecret] = useState("");
 
   // WooCommerce Form Inputs
-  const [wooUrl, setWooUrl] = useState("https://myclothingstore.com");
+  const [wooUrl, setWooUrl] = useState("");
   const [wooKey, setWooKey] = useState("");
   const [wooSecret, setWooSecret] = useState("");
 
@@ -113,11 +115,12 @@ export default function IntegrationHubPage() {
     try {
       const res = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations`));
       const data = await res.json();
-      if (data.integrations) {
+      if (!res.ok) throw new Error(data.detail || "Could not load saved integrations.");
+      if (Array.isArray(data.integrations)) {
         setIntegrations(data.integrations);
       }
     } catch (err) {
-      console.warn("Could not load integrations:", err);
+      setActionStatus(err instanceof Error ? err.message : "Could not load integrations. Please retry.");
     } finally {
       setLoading(false);
     }
@@ -273,7 +276,7 @@ export default function IntegrationHubPage() {
   // Connect Meta Handler (Manual)
   const handleConnectMeta = async () => {
     if (!metaToken.trim()) {
-      alert("Please enter a Meta Page Access Token (or use the prefill button).");
+      alert("Please enter your real Meta Page Access Token and Page ID.");
       return;
     }
     setIsSubmitting(true);
@@ -292,8 +295,10 @@ export default function IntegrationHubPage() {
           },
         }),
       });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Meta connection failed.");
       if (res.ok) {
-        setActionStatus("Meta Business Suite connected & AES-256 encrypted!");
+        setActionStatus(data.message);
         setMetaModalOpen(false);
         setMetaToken("");
         loadIntegrations();
@@ -308,7 +313,7 @@ export default function IntegrationHubPage() {
   // Connect Shopify Handler
   const handleConnectShopify = async () => {
     if (!shopifyToken.trim()) {
-      alert("Please enter a Shopify Admin API Access Token (or use the prefill button).");
+      alert("Please enter your Shopify Admin API Access Token.");
       return;
     }
     setIsSubmitting(true);
@@ -325,8 +330,10 @@ export default function IntegrationHubPage() {
           },
         }),
       });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Shopify credentials could not be saved.");
       if (res.ok) {
-        setActionStatus("Shopify Storefront connected & credentials encrypted!");
+        setActionStatus(data.message);
         setShopifyModalOpen(false);
         setShopifyToken("");
         loadIntegrations();
@@ -358,8 +365,10 @@ export default function IntegrationHubPage() {
           },
         }),
       });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "WooCommerce credentials could not be saved.");
       if (res.ok) {
-        setActionStatus("WooCommerce Store connected successfully!");
+        setActionStatus(data.message);
         setWooModalOpen(false);
         setWooKey("");
         setWooSecret("");
@@ -382,7 +391,7 @@ export default function IntegrationHubPage() {
       if (res.ok) {
         setActionStatus(`Disconnected ${provider.toUpperCase()} successfully.`);
         loadIntegrations();
-      }
+      } else throw new Error((await res.json()).detail || "Disconnect failed.");
     } catch (err: any) {
       alert("Disconnect error: " + err.message);
     }
@@ -396,6 +405,7 @@ export default function IntegrationHubPage() {
         method: "POST",
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Provider verification failed.");
       setDiagnostics((prev) => ({ ...prev, [provider]: data }));
     } catch (err: any) {
       setDiagnostics((prev) => ({ ...prev, [provider]: { status: "error", message: err.message } }));
@@ -419,8 +429,11 @@ export default function IntegrationHubPage() {
         }),
       });
       const data = await res.json();
+      if (!res.ok || data.status !== "success" || data.dispatch?.status !== "initiated") {
+        throw new Error(data.detail || data.message || "The provider did not confirm call dispatch.");
+      }
       setTestCallResult(data);
-      setActionStatus(`Voice confirmation call dispatched via Amber IT (+8809611901539) to ${testCallPhone}`);
+      setActionStatus("The calling provider confirmed dispatch.");
     } catch (err: any) {
       alert("Call dispatch error: " + err.message);
     } finally {
@@ -488,9 +501,9 @@ export default function IntegrationHubPage() {
 
       {/* Global Status Notification */}
       {actionStatus && (
-        <div className="p-3.5 bg-brand-50 border border-brand-100 rounded-xl text-xs text-brand-900 flex items-center justify-between animate-in slide-in-from-top-1">
+        <div role="status" className="p-3.5 bg-surface border border-border rounded-xl text-xs text-foreground flex items-center justify-between animate-in slide-in-from-top-1">
           <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-brand-600 flex-shrink-0" />
+            <Info className="w-4 h-4 text-muted flex-shrink-0" />
             <span className="font-semibold">{actionStatus}</span>
           </div>
           <button onClick={() => setActionStatus(null)} className="text-brand-700 hover:text-brand-900 text-xs font-bold">
@@ -513,7 +526,7 @@ export default function IntegrationHubPage() {
               {metaInt ? (
                 <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
                   <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
-                  Connected (Active)
+                  Page authorized
                 </span>
               ) : (
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-surface text-muted border border-border">
@@ -525,7 +538,7 @@ export default function IntegrationHubPage() {
             <div>
               <h3 className="text-base font-semibold text-foreground">Meta Business Suite</h3>
               <p className="text-xs text-muted mt-1">
-                Instagram DMs, Public Post/Reel Comments, and Messenger automation handled by Employee #1.
+                Authorize your Facebook Page and connected Instagram professional account.
               </p>
             </div>
 
@@ -546,26 +559,18 @@ export default function IntegrationHubPage() {
                   </span>
                 </div>
 
-                {diagnostics["meta"] && (
-                  <div className="mt-2 pt-2 border-t border-border/60 text-[11px] text-brand-800">
-                    {typeof diagnostics["meta"] === "string" ? (
-                      <span>{diagnostics["meta"]}</span>
-                    ) : (
-                      <div>
-                        <div className="font-bold flex items-center gap-1">
-                          <Check className="w-3 h-3 text-brand-600" /> {diagnostics["meta"].message}
-                        </div>
-                        <div className="text-muted mt-0.5">Latency: {diagnostics["meta"].latency_ms}ms &bull; 3 scopes verified</div>
-                      </div>
-                    )}
-                  </div>
-                )}
+                <IntegrationDiagnostic result={diagnostics["meta"]} />
               </div>
             ) : (
               <div className="p-3 bg-surface rounded-lg border border-border text-xs text-muted">
-                Connect your Meta Page to allow Employee #1 to listen to customer DMs and convert leads.
+                Connect your Meta Page to verify API access and authorize webhook subscriptions.
               </div>
             )}
+            <p className="text-[11px] leading-relaxed text-amber-800">
+              Page authorization does not enable automatic sales replies yet.
+              The Meta webhook-to-sales-agent dispatcher still needs implementation
+              and an end-to-end message test.
+            </p>
           </div>
 
           <div className="pt-4 border-t border-border mt-4 flex items-center gap-2">
@@ -610,7 +615,7 @@ export default function IntegrationHubPage() {
               {shopifyInt ? (
                 <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
                   <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
-                  Connected (Active)
+                  Credentials saved
                 </span>
               ) : (
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-surface text-muted border border-border">
@@ -645,20 +650,7 @@ export default function IntegrationHubPage() {
                   </span>
                 </div>
 
-                {diagnostics["shopify"] && (
-                  <div className="mt-2 pt-2 border-t border-border/60 text-[11px] text-brand-800">
-                    {typeof diagnostics["shopify"] === "string" ? (
-                      <span>{diagnostics["shopify"]}</span>
-                    ) : (
-                      <div>
-                        <div className="font-bold flex items-center gap-1">
-                          <Check className="w-3 h-3 text-brand-600" /> {diagnostics["shopify"].message}
-                        </div>
-                        <div className="text-muted mt-0.5">Latency: {diagnostics["shopify"].latency_ms}ms &bull; Webhooks Active</div>
-                      </div>
-                    )}
-                  </div>
-                )}
+                <IntegrationDiagnostic result={diagnostics["shopify"]} />
               </div>
             ) : (
               <div className="p-3 bg-surface rounded-lg border border-border text-xs text-muted">
@@ -709,7 +701,7 @@ export default function IntegrationHubPage() {
               {wooInt ? (
                 <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
                   <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
-                  Connected (Active)
+                  Credentials saved
                 </span>
               ) : (
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-surface text-muted border border-border">
@@ -742,20 +734,7 @@ export default function IntegrationHubPage() {
                   </span>
                 </div>
 
-                {diagnostics["woocommerce"] && (
-                  <div className="mt-2 pt-2 border-t border-border/60 text-[11px] text-brand-800">
-                    {typeof diagnostics["woocommerce"] === "string" ? (
-                      <span>{diagnostics["woocommerce"]}</span>
-                    ) : (
-                      <div>
-                        <div className="font-bold flex items-center gap-1">
-                          <Check className="w-3 h-3 text-brand-600" /> {diagnostics["woocommerce"].message}
-                        </div>
-                        <div className="text-muted mt-0.5">Latency: {diagnostics["woocommerce"].latency_ms}ms &bull; REST API Active</div>
-                      </div>
-                    )}
-                  </div>
-                )}
+                <IntegrationDiagnostic result={diagnostics["woocommerce"]} />
               </div>
             ) : (
               <div className="p-3 bg-surface rounded-lg border border-border text-xs text-muted">
@@ -803,9 +782,8 @@ export default function IntegrationHubPage() {
               <div className="w-10 h-10 rounded-lg bg-surface border border-border flex items-center justify-center">
                 <PhoneCall className="w-5 h-5 text-foreground" />
               </div>
-              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
-                Connected (Online)
+              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200">
+                Setup required
               </span>
             </div>
 
@@ -817,40 +795,12 @@ export default function IntegrationHubPage() {
             </div>
 
             <div className="space-y-2 bg-surface p-3.5 rounded-lg border border-border text-xs">
-              <div className="flex items-center justify-between text-muted">
-                <span>Caller ID:</span>
-                <span className="font-semibold text-foreground font-mono">+8809611901539</span>
-              </div>
-              <div className="flex items-center justify-between text-muted">
-                <span>SIP Extension:</span>
-                <span className="font-semibold text-foreground font-mono">524851</span>
-              </div>
-              <div className="flex items-center justify-between text-muted">
-                <span>PABX Gateway:</span>
-                <span className="font-semibold text-brand-700 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-brand-600"></span>
-                  pabx.amberit.com.bd
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-muted">
-                <span>AI Pipeline:</span>
-                <span className="font-mono text-foreground text-[10px]">Whisper + DeepSeek-V3</span>
-              </div>
-
-              {diagnostics["telephony"] && (
-                <div className="mt-2 pt-2 border-t border-border/60 text-[11px] text-brand-800">
-                  {typeof diagnostics["telephony"] === "string" ? (
-                    <span>{diagnostics["telephony"]}</span>
-                  ) : (
-                    <div>
-                      <div className="font-bold flex items-center gap-1">
-                        <Check className="w-3 h-3 text-brand-600" /> LiveKit ({diagnostics["telephony"]?.diagnostics?.livekit?.latency_ms || 408}ms) &bull; Amber IT ({diagnostics["telephony"]?.diagnostics?.amberit?.latency_ms || 14}ms)
-                      </div>
-                      <div className="text-muted mt-0.5">Trunk verified. Sub-800ms streaming active.</div>
-                    </div>
-                  )}
-                </div>
-              )}
+              <p className="text-muted leading-relaxed">
+                Calls are disabled until a compatible AmberIT SIP trunk, LiveKit SIP dialing,
+                and a running voice-agent worker are connected and tested.
+                A reachable LiveKit room does not verify outbound calling.
+              </p>
+              <IntegrationDiagnostic result={diagnostics["telephony"]} />
             </div>
           </div>
 
@@ -860,14 +810,14 @@ export default function IntegrationHubPage() {
               className="flex-1 py-2 px-3 bg-surface hover:bg-surface-hover border border-border text-foreground rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
             >
               <Activity className="w-3.5 h-3.5 text-brand-600" />
-              <span>Verify Trunk</span>
+              <span>Check configuration</span>
             </button>
             <button
               onClick={() => setTelephonyModalOpen(true)}
               className="py-2 px-3 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs font-semibold transition-colors shadow-sm flex items-center justify-center gap-1.5"
             >
               <PhoneForwarded className="w-3.5 h-3.5" />
-              <span>Test Call</span>
+              <span>Setup details</span>
             </button>
           </div>
         </div>
@@ -1038,14 +988,14 @@ export default function IntegrationHubPage() {
                       </p>
                     )}
 
-                    <button
+                    {import.meta.env.DEV && <button
                       type="button"
                       onClick={handleSimulateOAuth}
                       disabled={isDiscoveringPages}
                       className="text-[11px] font-semibold text-brand-700 hover:text-brand-900 py-1"
                     >
                       ⚡ Quick Test with Simulated OAuth Sandbox
-                    </button>
+                    </button>}
                   </div>
                 </div>
 
@@ -1145,13 +1095,13 @@ export default function IntegrationHubPage() {
                 <div>
                   <div className="flex items-center justify-between">
                     <label className="text-xs font-semibold text-foreground">Page Access Token (User / System Token)</label>
-                    <button
+                    {import.meta.env.DEV && <button
                       type="button"
                       onClick={() => setMetaToken("EAAGtest_sandbox_token_" + Math.random().toString(36).substring(2, 12))}
                       className="text-[11px] font-semibold text-brand-700 hover:text-brand-900"
                     >
                       + Prefill Verified Sandbox Token
-                    </button>
+                    </button>}
                   </div>
                   <textarea
                     value={metaToken}
@@ -1227,7 +1177,7 @@ export default function IntegrationHubPage() {
               <div>
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-semibold text-foreground">Admin API Access Token</label>
-                  <button
+                  {import.meta.env.DEV && <button
                     type="button"
                     onClick={() => {
                       setShopifyToken("shpat_test_token_" + Math.random().toString(36).substring(2, 12));
@@ -1236,7 +1186,7 @@ export default function IntegrationHubPage() {
                     className="text-[11px] font-semibold text-brand-700 hover:text-brand-900"
                   >
                     + Prefill Verified Sandbox Credentials
-                  </button>
+                  </button>}
                 </div>
                 <input
                   type="password"
@@ -1250,7 +1200,7 @@ export default function IntegrationHubPage() {
               <div>
                 <label className="text-xs font-semibold text-foreground">Webhook HMAC Signing Secret</label>
                 <input
-                  type="text"
+                  type="password"
                   value={shopifySecret}
                   onChange={(e) => setShopifySecret(e.target.value)}
                   placeholder="Found under Shopify Admin > Notifications > Webhooks"
@@ -1319,7 +1269,7 @@ export default function IntegrationHubPage() {
               <div>
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-semibold text-foreground">Consumer Key (Read/Write)</label>
-                  <button
+                  {import.meta.env.DEV && <button
                     type="button"
                     onClick={() => {
                       setWooKey("ck_test_" + Math.random().toString(36).substring(2, 12));
@@ -1328,7 +1278,7 @@ export default function IntegrationHubPage() {
                     className="text-[11px] font-semibold text-brand-700 hover:text-brand-900"
                   >
                     + Prefill Verified Sandbox Keys
-                  </button>
+                  </button>}
                 </div>
                 <input
                   type="text"
@@ -1492,19 +1442,10 @@ export default function IntegrationHubPage() {
             </div>
 
             <div className="p-6 space-y-4 max-h-[75vh] overflow-y-auto text-xs">
-              <div className="p-3.5 bg-surface border border-border rounded-xl space-y-2">
-                <div className="flex items-center justify-between text-muted">
-                  <span>Bangladeshi SIP Caller:</span>
-                  <span className="font-mono font-bold text-foreground">+8809611901539</span>
-                </div>
-                <div className="flex items-center justify-between text-muted">
-                  <span>PABX Switch &amp; Gateway:</span>
-                  <span className="font-mono text-foreground">202.4.97.37 (Ext: 524851)</span>
-                </div>
-                <div className="flex items-center justify-between text-muted">
-                  <span>Streaming Voice Stack:</span>
-                  <span className="font-semibold text-brand-700">Whisper-1 + DeepSeek-V3 + TTS-1 Alloy</span>
-                </div>
+              <div role="status" className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 leading-relaxed">
+                Calling is not enabled. Confirm AmberIT trunk compatibility, connect it to
+                LiveKit SIP, and deploy a voice-agent worker before testing.
+                This form cannot currently dispatch a call.
               </div>
 
               <div className="space-y-3">
@@ -1597,11 +1538,11 @@ export default function IntegrationHubPage() {
               </button>
               <button
                 onClick={handleTriggerTestCall}
-                disabled={isCalling || !testCallPhone.trim()}
+                disabled
                 className="py-2 px-4 rounded-lg bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white text-xs font-semibold transition-colors shadow-sm flex items-center gap-1.5"
               >
                 <PhoneForwarded className="w-3.5 h-3.5" />
-                <span>{isCalling ? "Dispatching Call..." : "Dispatch Call via Amber IT"}</span>
+                <span>Calling unavailable — setup required</span>
               </button>
             </div>
           </div>

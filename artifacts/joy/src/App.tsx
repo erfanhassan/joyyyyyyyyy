@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { apiUrl } from '@/lib/api';
+import { AuthLoading } from '@/components/auth-loading';
 import {
   ClerkProvider,
   SignIn,
@@ -118,8 +119,8 @@ function DashboardAccess({ authRequired }: { authRequired: boolean | null }) {
   if (authRequired === false) return <Dashboard />;
   if (authRequired === null || !isLoaded || (isSignedIn && ownerAccess === 'checking')) {
     return (
-      <div className="flex min-h-[60vh] items-center justify-center text-sm text-muted">
-        Checking secure access…
+      <div className="flex min-h-[70vh] items-center justify-center bg-surface px-4">
+        <AuthLoading label="Checking secure access…" />
       </div>
     );
   }
@@ -175,27 +176,31 @@ function AccessNotice({ title, message }: { title: string; message: string }) {
 }
 
 function SignInPage() {
+  const { isLoaded, isSignedIn } = useAuth();
+  if (isLoaded && isSignedIn) return <Redirect to="/dashboard/integration-hub" />;
   return (
     <main className="flex min-h-[100dvh] items-center justify-center bg-surface px-4 py-10">
-      <SignIn
+      {!isLoaded ? <AuthLoading /> : <SignIn
         routing="path"
         path={`${basePath}/sign-in`}
         signUpUrl={`${basePath}/sign-up`}
         appearance={clerkAppearance}
-      />
+      />}
     </main>
   );
 }
 
 function SignUpPage() {
+  const { isLoaded, isSignedIn } = useAuth();
+  if (isLoaded && isSignedIn) return <Redirect to="/dashboard/integration-hub" />;
   return (
     <main className="flex min-h-[100dvh] items-center justify-center bg-surface px-4 py-10">
-      <SignUp
+      {!isLoaded ? <AuthLoading /> : <SignUp
         routing="path"
         path={`${basePath}/sign-up`}
         signInUrl={`${basePath}/sign-in`}
         appearance={clerkAppearance}
-      />
+      />}
     </main>
   );
 }
@@ -266,8 +271,18 @@ function App() {
     requiresSignIn: boolean;
   } | null>(null);
   useEffect(() => {
-    fetch(apiUrl('/api/healthz'))
-      .then((response) => response.json())
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 8000);
+    fetch(apiUrl('/api/healthz'), { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Health check failed');
+        const health = await response.json();
+        if (typeof health.administration_available !== 'boolean' ||
+            typeof health.administration_requires_sign_in !== 'boolean') {
+          throw new Error('Invalid health check response');
+        }
+        return health;
+      })
       .then((health) =>
         setAdminAccess({
           disabled: health.administration_available === false,
@@ -279,7 +294,12 @@ function App() {
           disabled: true,
           requiresSignIn: true,
         }),
-      );
+      )
+      .finally(() => window.clearTimeout(timer));
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
   }, []);
   return (
     <WouterRouter base={basePath}>

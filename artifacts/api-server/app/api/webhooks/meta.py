@@ -15,8 +15,10 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
     Asynchronous background handler for Meta webhooks (comments, DMs, private replies).
     """
     logger.info(f"[Meta Background Worker] Processing event {event_id} for tenant {tenant_id}")
-    # Handled by LangGraph Agent (Employee #1: Social Sales Specialist)
-    await IdempotencyService.mark_event_completed(tenant_id, event_id)
+    # Receipt is not successful automation: this imported webhook has not yet
+    # been connected to the sales-agent worker. Never mark an unhandled event
+    # completed or imply that a reply was delivered.
+    logger.warning("Meta automation setup required: received event has no sales-agent dispatcher")
 
 
 @router.get("")
@@ -37,7 +39,7 @@ async def verify_meta_webhook(
         logger.info(f"Meta challenge verification successful for tenant {tenant_id}")
         return Response(content=hub_challenge, media_type="text/plain", status_code=200)
 
-    logger.warning(f"Meta challenge failed: received token '{hub_verify_token}' vs expected")
+    logger.warning("Meta challenge verification failed")
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Verification token mismatch",
@@ -108,4 +110,7 @@ async def receive_meta_webhook(
     background_tasks.add_task(process_meta_background, payload, tenant_id, event_id)
 
     # 6. Immediate HTTP 200 OK
-    return {"status": "received", "event_id": event_id, "tenant_id": tenant_id}
+    return {
+        "status": "received", "event_id": event_id, "tenant_id": tenant_id,
+        "automation_status": "setup_required",
+    }

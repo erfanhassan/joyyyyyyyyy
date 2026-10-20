@@ -1,4 +1,5 @@
 """Offline safety checks; never call AI, storefronts, or phone services."""
+import gzip
 import pytest
 import httpx
 from fastapi import HTTPException
@@ -100,28 +101,23 @@ def test_clerk_proxy_forwards_required_headers_and_cookie(production_client, mon
     monkeypatch.setenv("REPLIT_DOMAINS", "joy.example.test")
     calls = []
 
-    class FakeUpstreamResponse:
-        status_code = 200
-        headers = httpx.Headers(
-            {
+    real_client = httpx.AsyncClient
+
+    async def upstream(request):
+        calls.append((request.method, str(request.url), request.headers, request.content))
+        return httpx.Response(
+            200,
+            headers={
                 "content-type": "application/json",
                 "set-cookie": "clerk-session=test; Path=/; Secure; HttpOnly",
-            }
+            },
+            stream=httpx.ByteStream(b'{"ok":true}'),
         )
-        content = b'{"ok":true}'
 
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def request(self, method, url, headers, content):
-            calls.append((method, url, headers, content))
-            return FakeUpstreamResponse()
-
-    monkeypatch.setattr(main_module.httpx, "AsyncClient", lambda **_kwargs: FakeAsyncClient())
+    monkeypatch.setattr(
+        main_module.httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(upstream), **kwargs),
+    )
     response = production_client.post(
         "/api/__clerk/v1/client?test=1",
         content=b"request-body",
@@ -143,6 +139,49 @@ def test_clerk_proxy_forwards_required_headers_and_cookie(production_client, mon
     assert headers["Clerk-Secret-Key"] == "test-only-clerk-secret"
     assert headers["cookie"] == "__client_uat=1"
     assert body == b"request-body"
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br", "zstd"])
+def test_clerk_proxy_preserves_encoded_wire_bytes(production_client, monkeypatch, encoding):
+    monkeypatch.setattr(settings, "CLERK_SECRET_KEY", "test-only-clerk-secret")
+    source = b'console.log("Clerk script loads");'
+    wire = gzip.compress(source) if encoding == "gzip" else b"\x5b\x54\xec\x14compressed"
+    real_client = httpx.AsyncClient
+
+    async def upstream(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/javascript", "content-encoding": encoding},
+            stream=httpx.ByteStream(wire),
+        )
+
+    monkeypatch.setattr(
+        main_module.httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(upstream), **kwargs),
+    )
+    # Capture ASGI messages directly: a test HTTP client may itself decode the
+    # body, hiding the exact compressed-byte regression that broke production.
+    import asyncio
+    messages = []
+
+    async def capture(message):
+        messages.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http", "method": "GET", "path": "/api/__clerk/npm/clerk.js",
+        "query_string": b"", "headers": [(b"host", b"joy.example.test")],
+        "scheme": "https", "server": ("joy.example.test", 443), "client": ("127.0.0.1", 1),
+        "http_version": "1.1",
+    }
+    asyncio.run(app(scope, receive, capture))
+    headers = dict(messages[0]["headers"])
+    assert messages[0]["status"] == 200
+    assert headers[b"content-encoding"] == encoding.encode()
+    assert headers[b"content-length"] == str(len(wire)).encode()
+    assert b"".join(item.get("body", b"") for item in messages[1:]) == wire
 
 
 @pytest.mark.parametrize("provider", ["meta", "shopify", "woocommerce", "custom"])

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.db.models import Tenant, TenantIntegration, Order
 from app.core.security import encrypt_token, decrypt_token
-from app.services.telephony_service import TelephonyService
+from app.services.telephony_service import TelephonyService, OutboundCallingUnavailable
 import httpx
 import time
 
@@ -166,6 +166,20 @@ async def save_tenant_integration(
     Encrypts access tokens via AES-256 Fernet and persists credentials in PostgreSQL
     with envelope encryption.
     """
+    if any(marker in payload.access_token.lower() for marker in ("simulated", "sandbox_token")) or payload.access_token.startswith(("joy_", "mock_", "test_")):
+        raise HTTPException(status_code=400, detail="Use real provider credentials. Demo tokens cannot connect an integration.")
+    if payload.provider == "meta":
+        return await meta_select_page(
+            tenant_id,
+            MetaSelectPageRequest(
+                page_id=str(payload.settings.get("page_id") or ""),
+                page_name=str(payload.settings.get("page_name") or ""),
+                page_access_token=payload.access_token,
+                instagram_account_id=payload.settings.get("instagram_account_id"),
+            ),
+            db,
+        )
+
     # Verify tenant exists
     tenant_stmt = select(Tenant).where(Tenant.id == tenant_id)
     t_res = await db.execute(tenant_stmt)
@@ -212,7 +226,7 @@ async def save_tenant_integration(
         "action": action,
         "provider": payload.provider,
         "is_active": True,
-        "message": f"{payload.provider.capitalize()} integration encrypted and connected successfully.",
+        "message": f"{payload.provider.capitalize()} credentials saved and encrypted. Live provider access and webhook delivery still need verification.",
     }
 
 
@@ -272,7 +286,22 @@ async def meta_select_page(
     if not t_res.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Tenant does not exist.")
 
+    if not payload.page_id.isdigit() or not payload.page_access_token:
+        raise HTTPException(status_code=400, detail="A real Facebook Page ID and Page access token are required.")
+    page_identity = await MetaAPIClient.get_page_identity(
+        payload.page_id, payload.page_access_token,
+    )
     encrypted_token = encrypt_token(payload.page_access_token)
+    # Do not persist a successful connection unless Meta confirms subscription.
+    webhook_sub_res = await MetaAPIClient.subscribe_page_to_webhooks(
+        page_id=payload.page_id,
+        page_access_token=payload.page_access_token,
+    )
+    if webhook_sub_res.get("success") is not True:
+        raise HTTPException(
+            status_code=400,
+            detail="Meta did not approve the Page webhook subscription. Check the Page permissions and app configuration, then retry.",
+        )
 
     stmt = select(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant_id,
@@ -282,11 +311,11 @@ async def meta_select_page(
     existing = result.scalar_one_or_none()
 
     settings_data = {
-        "page_name": payload.page_name,
+        "page_name": page_identity["name"],
         "page_id": payload.page_id,
         "instagram_account_id": payload.instagram_account_id or "",
         "instagram_username": payload.instagram_username or "",
-        "permissions_granted": [
+        "requested_permissions": [
             "pages_show_list",
             "pages_read_engagement",
             "pages_manage_posts",
@@ -316,13 +345,6 @@ async def meta_select_page(
 
     await db.commit()
     await db.refresh(integration_obj)
-
-    # Attempt to auto-subscribe the Facebook page to Joy's webhooks
-    webhook_sub_res = await MetaAPIClient.subscribe_page_to_webhooks(
-        page_id=payload.page_id,
-        page_access_token=payload.page_access_token,
-    )
-    logger.info(f"Subscribed page {payload.page_id} to webhooks: {webhook_sub_res}")
 
     return {
         "status": "success",
@@ -373,6 +395,9 @@ async def test_integration_connection(
     """
     Tests live communication with provider API or validates encrypted credentials.
     """
+    if provider in ("telephony", "amberit", "livekit"):
+        return await TelephonyService.test_telephony_status()
+
     stmt = select(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant_id,
         TenantIntegration.provider == provider,
@@ -380,7 +405,7 @@ async def test_integration_connection(
     res = await db.execute(stmt)
     integration = res.scalar_one_or_none()
 
-    if not integration:
+    if not integration or not integration.is_active:
         return {
             "status": "unconfigured",
             "provider": provider,
@@ -392,41 +417,26 @@ async def test_integration_connection(
     try:
         raw_token = decrypt_token(integration.access_token_encrypted)
         is_token_valid = len(raw_token) > 0
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
             "provider": provider,
             "connected": False,
-            "message": f"Token decryption error: {str(e)}",
+            "message": "Stored credentials could not be decrypted. Check the server encryption configuration.",
         }
 
     # Provider specific diagnostics
     if provider == "meta":
-        page_name = integration.settings.get("page_name", integration.settings.get("account_name", "Connected Page"))
-        page_id = integration.settings.get("page_id", "me")
+        page_name = integration.settings.get("page_name", "Facebook Page")
+        page_id = integration.settings.get("page_id", "")
         ig_id = integration.settings.get("instagram_account_id", "")
-        latency = 112
-        if raw_token and not raw_token.startswith(("joy_", "mock_", "test_")):
-            try:
-                t0 = time.time()
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v19.0/{page_id}?fields=id,name&access_token={raw_token}"
-                    )
-                    latency = max(1, int((time.time() - t0) * 1000))
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        page_name = data.get("name", page_name)
-                    else:
-                        return {
-                            "status": "warning",
-                            "provider": "meta",
-                            "connected": False,
-                            "latency_ms": latency,
-                            "message": f"Meta Graph API error ({resp.status_code}): {resp.text[:120]}",
-                        }
-            except Exception as ex:
-                logger.warning(f"Live Meta ping failed: {ex}")
+        t0 = time.monotonic()
+        try:
+            identity = await MetaAPIClient.get_page_identity(page_id, raw_token)
+            page_name = identity["name"]
+        except HTTPException as exc:
+            return {"status": "error", "provider": "meta", "connected": False, "message": exc.detail}
+        latency = max(1, int((time.monotonic() - t0) * 1000))
 
         return {
             "status": "healthy",
@@ -434,53 +444,33 @@ async def test_integration_connection(
             "connected": True,
             "account_name": page_name,
             "instagram_account_id": ig_id or "Not linked",
-            "verified_permissions": [
-                "instagram_manage_messages",
-                "pages_messaging",
-                "pages_read_engagement",
-            ],
             "latency_ms": latency,
-            "message": f"Meta Graph API connection verified for '{page_name}'. Ready to receive webhooks.",
+            "message": f"Page API access verified for '{page_name}'. End-to-end webhook delivery and replies require a separate message test.",
         }
     elif provider == "shopify":
         return {
-            "status": "healthy",
+            "status": "not_verified",
             "provider": "shopify",
-            "connected": True,
+            "connected": False,
             "shop_domain": integration.settings.get("shop_domain", "store.myshopify.com"),
             "webhook_endpoint": f"/api/v1/webhooks/shopify/{tenant_id}",
-            "verified_topics": ["orders/create", "orders/updated", "products/update"],
-            "latency_ms": 84,
-            "message": "Shopify Storefront REST API verified. Webhook HMAC active.",
+            "message": "Shopify credentials are stored. Live API access and webhook delivery have not been verified.",
         }
     elif provider == "woocommerce":
         return {
-            "status": "healthy",
+            "status": "not_verified",
             "provider": "woocommerce",
-            "connected": True,
+            "connected": False,
             "store_url": integration.settings.get("store_url", "https://mystore.com"),
             "webhook_endpoint": f"/api/v1/webhooks/woocommerce/{tenant_id}",
-            "latency_ms": 140,
-            "message": "WooCommerce REST API connection verified. Order sync active.",
-        }
-    elif provider in ("telephony", "amberit", "livekit"):
-        status_res = await TelephonyService.test_telephony_status()
-        diag = status_res.get("diagnostics", {})
-        livekit_ok = diag.get("livekit", {}).get("connected", False)
-        amberit_ok = diag.get("amberit", {}).get("connected", False)
-        return {
-            "status": "healthy" if (livekit_ok or amberit_ok) else "error",
-            "provider": provider,
-            "connected": livekit_ok and amberit_ok,
-            "diagnostics": diag,
-            "message": "LiveKit WebRTC Cloud & Amber IT Bangladesh SIP Gateway verified.",
+            "message": "WooCommerce credentials are stored. Live API access and webhook delivery have not been verified.",
         }
     else:
         return {
-            "status": "healthy",
+            "status": "not_verified",
             "provider": provider,
-            "connected": True,
-            "message": f"{provider.capitalize()} connection active.",
+            "connected": False,
+            "message": f"{provider.capitalize()} credentials are stored; no live verification is implemented.",
         }
 
 
@@ -513,6 +503,11 @@ async def trigger_test_call(
     Triggers an outbound confirmation call via LiveKit Cloud & Amber IT Bangladesh PABX.
     Persists order in PostgreSQL and dispatches call over WebRTC / SIP.
     """
+    try:
+        TelephonyService.require_outbound_calling()
+    except OutboundCallingUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
     order_id = uuid.uuid4()
     order = Order(
         id=order_id,

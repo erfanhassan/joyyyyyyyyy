@@ -94,6 +94,14 @@ class VoiceConfirmationAgent:
         """
         Executes order verification pipeline for an incoming order.
         """
+        # Do not increment attempts, claim a WhatsApp fallback was dispatched,
+        # or acquire a lock while the outbound implementation is unavailable.
+        from app.services.telephony_service import OutboundCallingUnavailable
+        try:
+            TelephonyService.require_outbound_calling()
+        except OutboundCallingUnavailable as exc:
+            return {"status": "setup_required", "message": str(exc)}
+
         # 1. Fetch Order Record
         stmt = select(Order).where(Order.id == order_id, Order.tenant_id == tenant_id)
         res = await db.execute(stmt)
