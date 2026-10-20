@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "export NODE_ENV=development && pnpm run build && pnpm run start",
-    "build": "node ./build.mjs",
-    "start": "node --enable-source-maps ./dist/index.mjs",
+    "dev": "cd ../.. && uv run --frozen python -m uvicorn app.main:app --app-dir artifacts/api-server --host 0.0.0.0 --port \"$PORT\"",
+    "build": "cd ../.. && uv sync --frozen && uv run --frozen python -m compileall -q artifacts/api-server/app",
+    "start": "pnpm run dev",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

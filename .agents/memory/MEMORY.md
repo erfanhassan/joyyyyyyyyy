@@ -1,0 +1,1 @@
+- [Migration boundaries](migration-boundaries.md) — preserve the imported Python backend and original design; the empty database scaffold is not authoritative.

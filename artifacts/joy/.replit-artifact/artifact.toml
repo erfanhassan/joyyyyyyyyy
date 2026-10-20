@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Project JOY"
+description = "Multi-tenant digital workforce platform with an employee roster, integration hub, knowledge brain, and live operator workbench."
+version = "1.0.0"
+id = "artifacts/joy"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19399
+
+[services.development]
+run = "pnpm --filter @workspace/joy run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/joy", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/joy/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19399"
+BASE_PATH = "/"
