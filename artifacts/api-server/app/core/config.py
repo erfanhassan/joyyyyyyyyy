@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     # Auth & Security
     CLERK_SECRET_KEY: str = ""
     CLERK_PUBLISHABLE_KEY: str = ""
+    JOY_INITIAL_ADMIN_EMAIL: str = ""
     ENCRYPTION_KEY_SECRET: str = Field(
         default_factory=lambda: os.environ.get("SESSION_SECRET", "")
     )

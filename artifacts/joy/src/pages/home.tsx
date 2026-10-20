@@ -66,6 +66,13 @@ export default function Home() {
             </Link>
 
             <Link
+              href="/sign-in"
+              className="text-xs font-semibold px-3 py-1.5 text-muted hover:text-foreground transition-colors"
+            >
+              Sign in
+            </Link>
+
+            <Link
               href="/dashboard/integration-hub"
               className="text-xs font-semibold px-4 py-2 rounded-lg bg-foreground text-white hover:bg-foreground/90 transition-colors shadow-sm flex items-center gap-1.5"
             >

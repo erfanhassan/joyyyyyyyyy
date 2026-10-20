@@ -7,6 +7,7 @@ dependencies = [
     "alembic>=1.13.1",
     "asyncpg>=0.29.0",
     "beautifulsoup4>=4.12.3",
+    "clerk-backend-api>=7.0.0",
     "cryptography>=42.0.5",
     "fastapi>=0.110.0",
     "httpx>=0.27.0",

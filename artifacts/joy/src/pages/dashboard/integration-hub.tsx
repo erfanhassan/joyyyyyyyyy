@@ -65,6 +65,7 @@ export default function IntegrationHubPage() {
     has_instagram: boolean;
   }>>([]);
   const [isDiscoveringPages, setIsDiscoveringPages] = useState(false);
+  const [metaAppId, setMetaAppId] = useState("");
 
   // Shopify Form Inputs
   const [shopifyDomain, setShopifyDomain] = useState("luxury-store.myshopify.com");
@@ -124,6 +125,13 @@ export default function IntegrationHubPage() {
 
   useEffect(() => {
     loadIntegrations();
+    fetch(apiUrl("/api/auth/me"), { credentials: "include" })
+      .then(async (response) => {
+        if (!response.ok) return;
+        const data = await response.json();
+        setMetaAppId(typeof data.meta_app_id === "string" ? data.meta_app_id : "");
+      })
+      .catch(() => setMetaAppId(""));
   }, [tenantId]);
 
   const copyEmbedCode = () => {
@@ -137,7 +145,10 @@ export default function IntegrationHubPage() {
 
   // Launch Meta Login Dialog Popup
   const handleLaunchMetaLogin = () => {
-    const appId = import.meta.env.VITE_META_APP_ID || "2021434265932652";
+    if (!metaAppId) {
+      setActionStatus("Meta sign-in is unavailable because META_APP_ID is not configured.");
+      return;
+    }
     const redirectUri = window.location.origin + "/dashboard/integration-hub";
     const scopes = [
       "pages_show_list",
@@ -149,7 +160,7 @@ export default function IntegrationHubPage() {
       "instagram_manage_comments",
     ].join(",");
 
-    const oauthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(
+    const oauthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(metaAppId)}&redirect_uri=${encodeURIComponent(
       redirectUri
     )}&scope=${encodeURIComponent(scopes)}&response_type=token,granted_scopes`;
 
@@ -1015,12 +1026,17 @@ export default function IntegrationHubPage() {
                     <button
                       type="button"
                       onClick={handleLaunchMetaLogin}
-                      disabled={isDiscoveringPages}
-                      className="w-full py-2.5 px-4 bg-[#1877F2] hover:bg-[#166fe5] text-white font-semibold rounded-lg text-xs transition-colors shadow-sm flex items-center justify-center gap-2"
+                      disabled={isDiscoveringPages || !metaAppId}
+                      className="w-full py-2.5 px-4 bg-[#1877F2] hover:bg-[#166fe5] disabled:cursor-not-allowed disabled:opacity-50 text-white font-semibold rounded-lg text-xs transition-colors shadow-sm flex items-center justify-center gap-2"
                     >
                       <Share2 className="w-4 h-4" />
                       <span>{isDiscoveringPages ? "Waiting for Meta Authorization..." : "Log In With Facebook (1-Click)"}</span>
                     </button>
+                    {!metaAppId && (
+                      <p className="text-[11px] text-muted">
+                        Meta sign-in is unavailable until the server's Meta app ID is configured.
+                      </p>
+                    )}
 
                     <button
                       type="button"

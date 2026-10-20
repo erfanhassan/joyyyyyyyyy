@@ -1,11 +1,12 @@
-"""Keep inherited unauthenticated admin endpoints closed in public deployments.
-
-No shared password or tenant ID is treated as authentication. Until proper
-tenant-authorized login is implemented, production administration is unavailable.
-"""
+"""Restrict public production administration to the configured JOY owner."""
 import os
 from starlette.responses import JSONResponse
 from app.core.config import settings
+from app.core.clerk_auth import (
+    ClerkAuthFailure,
+    authenticate_owner,
+    clerk_auth_configured,
+)
 
 
 def is_public_deployment() -> bool:
@@ -19,6 +20,8 @@ def is_public_deployment() -> bool:
 def is_public_route(path: str, method: str) -> bool:
     if path in ("/health", "/api/healthz"):
         return method in ("GET", "HEAD")
+    if path == "/api/__clerk" or path.startswith("/api/__clerk/"):
+        return method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
     if path in ("/api/widget/widget.js", "/api/v1/widget/widget.js"):
         return method == "GET"
     if path in ("/api/widget/chat", "/api/v1/widget/chat"):
@@ -48,16 +51,47 @@ class DeploymentGuard:
 
     async def __call__(self, scope, receive, send):
         if is_public_deployment():
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 1008})
+            scope_type = scope["type"]
+            path = scope.get("path", "")
+            method = scope.get("method", "")
+            if scope_type == "http" and is_public_route(path, method):
+                await self.app(scope, receive, send)
                 return
-            if scope["type"] == "http" and not is_public_route(
-                scope["path"], scope["method"]
-            ):
-                response = JSONResponse(
-                    status_code=403,
-                    content={"detail": "Administration is disabled in public deployments until tenant-authorized sign-in is configured."},
-                )
-                await response(scope, receive, send)
+
+            if scope_type not in ("http", "websocket"):
+                await self.app(scope, receive, send)
                 return
+
+            if not clerk_auth_configured():
+                if scope_type == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    response = JSONResponse(
+                        status_code=403,
+                        content={
+                            "detail": "Administration is disabled until secure sign-in is configured."
+                        },
+                    )
+                    await response(scope, receive, send)
+                return
+
+            try:
+                identity = await authenticate_owner(scope)
+            except ClerkAuthFailure as exc:
+                if scope_type == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    response = JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                    )
+                    await response(scope, receive, send)
+                return
+
+            scope.setdefault("state", {}).update(
+                {
+                    "clerk_user_id": identity["user_id"],
+                    "is_joy_owner": True,
+                }
+            )
         await self.app(scope, receive, send)
