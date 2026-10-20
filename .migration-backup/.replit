@@ -1,0 +1,14 @@
+modules = ["python-3.12", "nodejs-20", "bash", "web"]
+run = "bash start.sh"
+entrypoint = "start.sh"
+
+[nix]
+channel = "stable-25_05"
+
+[deployment]
+run = ["bash", "start.sh"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 3000
+externalPort = 80
