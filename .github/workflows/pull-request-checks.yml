@@ -1,0 +1,69 @@
+name: Pull request checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-request-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-typecheck:
+    name: Frontend type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.1
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check the JOY frontend
+        run: pnpm --filter @workspace/joy run typecheck
+
+  deployment-safety:
+    name: Deployment safety tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+
+      - name: Run offline deployment safety tests
+        env:
+          PYTHONPATH: artifacts/api-server
+          CI: "true"
+        run: uv run --frozen python -m pytest -q artifacts/api-server/tests/test_deployment_guard.py
