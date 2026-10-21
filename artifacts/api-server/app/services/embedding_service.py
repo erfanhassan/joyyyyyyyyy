@@ -32,34 +32,47 @@ class EmbeddingService:
         if not texts:
             return []
 
-        # 1. If OpenAI API key is configured, call text-embedding-3-small
+        # 1. If OpenAI API key is configured, call text-embedding-3-small with retry
         if settings.OPENAI_API_KEY:
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
-                        "https://api.openai.com/v1/embeddings",
-                        headers={
-                            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": "text-embedding-3-small",
-                            "input": texts,
-                            "dimensions": EMBEDDING_DIM,
-                        },
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        embeddings = [item["embedding"] for item in data["data"]]
-                        return embeddings
-                    else:
-                        logger.warning(
-                            f"OpenAI embedding API returned status {response.status_code}: {response.text}. Using fallback."
+            max_retries = 3
+            backoff = 1.0
+            last_err = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.post(
+                            "https://api.openai.com/v1/embeddings",
+                            headers={
+                                "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "model": "text-embedding-3-small",
+                                "input": texts,
+                                "dimensions": EMBEDDING_DIM,
+                            },
                         )
-            except Exception as e:
-                logger.error(f"Error calling OpenAI embedding API: {e}. Using deterministic fallback.")
+                        if response.status_code == 200:
+                            data = response.json()
+                            embeddings = [item["embedding"] for item in data["data"]]
+                            return embeddings
+                        else:
+                            last_err = f"OpenAI embedding API returned status {response.status_code}: {response.text}"
+                            logger.warning(f"Embedding attempt {attempt}/{max_retries} failed: {last_err}")
+                except Exception as e:
+                    last_err = str(e)
+                    logger.warning(f"Embedding attempt {attempt}/{max_retries} encountered exception: {e}")
 
-        # 2. Deterministic normalized embedding fallback for development / offline testing
+                if attempt < max_retries:
+                    import asyncio
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+
+            # Do NOT silently fall back to deterministic vectors when API key is configured
+            raise RuntimeError(f"OpenAI embedding generation failed after {max_retries} attempts: {last_err}")
+
+        # 2. Deterministic normalized embedding ONLY when no OPENAI_API_KEY is configured (e.g. offline unit testing)
+        logger.info("OPENAI_API_KEY not configured. Generating deterministic embeddings for testing.")
         return [EmbeddingService._generate_deterministic_embedding(t) for t in texts]
 
     @staticmethod

@@ -149,4 +149,69 @@ async def query_knowledge_brain(
         "query": request.query,
         "results_count": len(snippets),
         "snippets": snippets,
+        "results": snippets,
     }
+
+
+@router.get("/documents")
+async def list_documents(
+    tenant_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List all ingested documents and their chunk counts for a tenant.
+    """
+    from app.db.models import KnowledgeDocument, DocumentChunk
+    from sqlalchemy import func, select
+
+    stmt = (
+        select(
+            KnowledgeDocument.id,
+            KnowledgeDocument.title,
+            KnowledgeDocument.source_type,
+            KnowledgeDocument.source_url,
+            KnowledgeDocument.created_at,
+            func.count(DocumentChunk.id).label("chunks_count"),
+        )
+        .outerjoin(DocumentChunk, DocumentChunk.document_id == KnowledgeDocument.id)
+        .where(KnowledgeDocument.tenant_id == tenant_id)
+        .group_by(KnowledgeDocument.id)
+        .order_by(KnowledgeDocument.created_at.desc())
+    )
+    res = await db.execute(stmt)
+    rows = res.all()
+
+    docs = []
+    for r in rows:
+        docs.append({
+            "id": str(r.id),
+            "title": r.title,
+            "sourceType": r.source_type,
+            "sourceUrl": r.source_url,
+            "chunksCount": r.chunks_count,
+            "createdAt": r.created_at.strftime("%b %d, %Y") if r.created_at else "Recently",
+            "status": "HNSW 1536-dim Indexed",
+        })
+
+    return {"status": "success", "documents": docs}
+
+
+@router.delete("/documents/{document_id}")
+async def delete_document(
+    document_id: UUID,
+    tenant_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Deletes a knowledge document and cascades deletion of its vector chunks.
+    """
+    from app.db.models import KnowledgeDocument
+    from sqlalchemy import delete
+
+    stmt = delete(KnowledgeDocument).where(
+        KnowledgeDocument.id == document_id,
+        KnowledgeDocument.tenant_id == tenant_id,
+    )
+    await db.execute(stmt)
+    await db.commit()
+    return {"status": "success", "message": "Document deleted successfully"}

@@ -23,6 +23,7 @@ import {
   ArrowRight
 } from "lucide-react";
 import { apiUrl, getWsUrl } from "@/lib/api";
+import { useTenant } from "@/lib/tenant-context";
 
 interface ConversationItem {
   id: string;
@@ -57,7 +58,7 @@ export default function OperatorWorkbenchPage() {
   const [simulationStatus, setSimulationStatus] = useState<string | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
 
-  const tenantId = "a1e6f58d-b575-420e-b4d6-1fef0064e746";
+  const { tenantId } = useTenant();
   const wsRef = useRef<WebSocket | null>(null);
 
   // Fetch conversations function
@@ -262,7 +263,10 @@ export default function OperatorWorkbenchPage() {
           message: "Hi! Do you have the Mulberry silk Panjabi in stock?",
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Request failed with HTTP ${res.status}`);
+      }
       setSimulationStatus("Success: Employee #1 matched catalog and generated checkout link!");
       fetchConversations();
       if (data.conversation_id) {
@@ -290,7 +294,10 @@ export default function OperatorWorkbenchPage() {
           customer_identifier: "@sadia_dhaka",
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Request failed with HTTP ${res.status}`);
+      }
       setSimulationStatus("Triggered: Sentiment Risk = 0.85 (Crimson Alert & AI Halted)");
       setAlertBanner({
         customer: "Sadia (Angry Shopper)",
@@ -320,11 +327,15 @@ export default function OperatorWorkbenchPage() {
           tenant_id: tenantId,
           call_id: callId,
           customer_phone: "+8801712345678",
-          confirmed: true,
+          order_confirmed: true,
           transcript: "Agent: Hi Rahim, calling from Joy Store to verify your delivery address to Banani, Dhaka.\nCustomer: Yes, please deliver to Road 11, House 42.\nAgent: Address verified and order confirmed!",
           sentiment_score: 0.95,
         }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Telephony completion rejected with HTTP ${res.status}`);
+      }
       setSimulationStatus("Success: Employee #2 completed outbound call & synced order!");
       fetchConversations();
     } catch (e: any) {

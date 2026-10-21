@@ -36,7 +36,17 @@ def clerk_auth_configured() -> bool:
 
 def _deployment_origins() -> set[str]:
     origins: set[str] = set()
-    for value in os.environ.get("REPLIT_DOMAINS", "").split(","):
+    raw_domains = ",".join(
+        filter(
+            None,
+            [
+                os.environ.get("REPLIT_DOMAINS", ""),
+                os.environ.get("CUSTOM_DOMAINS", ""),
+                os.environ.get("DOMAIN", ""),
+            ],
+        )
+    )
+    for value in raw_domains.split(","):
         domain = value.strip()
         if not domain:
             continue

@@ -298,25 +298,63 @@ class HITLOrchestrator:
         db.add(conv)
         await db.commit()
 
-        # 2. Dispatch to external channel
-        dispatch_status = "logged"
-        try:
-            if conv.channel == "instagram":
-                await MetaAPIClient.send_instagram_dm(
-                    recipient_id=conv.customer_identifier,
-                    message_text=message_text,
-                )
-                dispatch_status = "dispatched_instagram"
-            elif conv.channel == "facebook":
-                await MetaAPIClient.send_facebook_messenger_dm(
-                    recipient_id=conv.customer_identifier,
-                    message_text=message_text,
-                )
-                dispatch_status = "dispatched_facebook"
-        except Exception as e:
-            logger.warning(f"External channel dispatch error: {e}")
+        # 2. Resolve merchant Page credentials for Meta dispatch
+        from app.db.models import TenantIntegration
+        from app.core.security import decrypt_token
 
-        # 3. Broadcast to all open workbench sockets
+        page_token = None
+        try:
+            int_stmt = select(TenantIntegration).where(
+                TenantIntegration.tenant_id == tenant_id,
+                TenantIntegration.provider == "meta",
+                TenantIntegration.is_active == True,
+            ).limit(1)
+            int_res = await db.execute(int_stmt)
+            meta_int = int_res.scalars().first()
+            if meta_int and meta_int.access_token_encrypted:
+                page_token = decrypt_token(meta_int.access_token_encrypted)
+        except Exception as e:
+            logger.warning(f"Failed to load Page token for human reply: {e}")
+
+        # 3. Dispatch to external channel
+        dispatch_status = "saved_locally"
+        dispatch_error = None
+        provider_response = None
+
+        if conv.channel in ("instagram", "facebook"):
+            try:
+                if conv.channel == "instagram":
+                    provider_response = await MetaAPIClient.send_instagram_dm(
+                        recipient_id=conv.customer_identifier,
+                        message_text=message_text,
+                        page_access_token=page_token,
+                    )
+                    dispatch_status = "dispatched_instagram"
+                elif conv.channel == "facebook":
+                    provider_response = await MetaAPIClient.send_facebook_messenger_dm(
+                        recipient_id=conv.customer_identifier,
+                        message_text=message_text,
+                        page_access_token=page_token,
+                    )
+                    dispatch_status = "dispatched_facebook"
+            except Exception as e:
+                dispatch_status = "failed_provider"
+                dispatch_error = str(e)
+                logger.error(f"External channel dispatch error: {e}")
+        elif conv.channel == "web_widget":
+            dispatch_status = "dispatched_web_widget"
+
+        # Update log entry with real delivery outcome
+        log_entry.raw_payload = {
+            "operator_name": operator_name,
+            "dispatch_status": dispatch_status,
+            "error": dispatch_error,
+            "provider_response": provider_response,
+        }
+        db.add(log_entry)
+        await db.commit()
+
+        # 4. Broadcast to all open workbench sockets
         event = {
             "type": "new_message",
             "conversation_id": str(conversation_id),
@@ -324,14 +362,17 @@ class HITLOrchestrator:
             "sender_type": "human_operator",
             "message_text": message_text,
             "operator_name": operator_name,
+            "dispatch_status": dispatch_status,
+            "dispatch_error": dispatch_error,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await cls.broadcast_workbench_event(tenant_id, event)
 
         return {
-            "status": "success",
+            "status": "success" if dispatch_status != "failed_provider" else "delivery_failed",
             "conversation_id": str(conversation_id),
             "dispatch_status": dispatch_status,
+            "error": dispatch_error,
             "message_text": message_text,
         }
 

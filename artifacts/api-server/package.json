@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "cd ../.. && uv run --frozen python -m uvicorn app.main:app --app-dir artifacts/api-server --host 0.0.0.0 --port \"$PORT\"",
+    "dev": "cd ../.. && uv run --frozen python -m uvicorn app.main:app --app-dir artifacts/api-server --host 0.0.0.0 --port \"${PORT:-8080}\"",
     "build": "cd ../.. && uv sync --frozen && uv run --frozen python -m compileall -q artifacts/api-server/app",
     "start": "pnpm run dev",
     "typecheck": "tsc -p tsconfig.json --noEmit"

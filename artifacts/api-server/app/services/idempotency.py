@@ -28,24 +28,24 @@ _in_memory_cache: dict = {}
 
 class IdempotencyService:
     """
-    Manages Redis SETNX idempotency keys with a 24-hour TTL (86,400 seconds)
-    to enforce strict at-most-once processing across webhooks.
-    Gracefully falls back to in-memory tracking if Redis is unreachable.
+    Manages lease-based idempotency locks with Redis and PostgreSQL fallback.
+    Uses short leases (300s) for in-flight processing to ensure provider retries
+    are NOT discarded if an unhandled failure occurs, and 24h TTL for completed events.
     """
 
     @staticmethod
     async def check_and_set_event(
         tenant_id: str,
         event_id: str,
-        ttl_seconds: int = 86400,
+        processing_lease_seconds: int = 300,
     ) -> bool:
         """
-        Attempts to acquire an idempotency lock for (tenant_id, event_id).
+        Attempts to acquire a processing lease for (tenant_id, event_id).
         Key pattern: idempotency:{tenant_id}:{event_id}
-        
+
         Returns:
-            True: If the event is NEW (lock acquired, proceed with processing).
-            False: If the event is a DUPLICATE within the TTL (drop silently).
+            True: If the event is NEW or an expired lease (proceed with processing).
+            False: If the event is already COMPLETED or currently being processed under an active lease.
         """
         if not event_id:
             return True
@@ -56,21 +56,35 @@ class IdempotencyService:
 
         try:
             r = get_redis_client()
-            # SETNX with expiration (86400s = 24h)
-            is_new = await r.set(key, "processing", ex=ttl_seconds, nx=True)
+            current_status = await r.get(key)
+            if current_status == "completed":
+                logger.info(f"Event already successfully processed. Dropping duplicate: {key}")
+                return False
+            if current_status == "processing":
+                logger.info(f"Event currently processing under active lease. Dropping duplicate: {key}")
+                return False
+
+            # Acquire processing lease
+            is_new = await r.set(key, "processing", ex=processing_lease_seconds, nx=True)
             if not is_new:
-                logger.info(f"Duplicate webhook event detected and dropped via Redis: {key}")
                 return False
             return True
         except Exception as e:
             logger.debug(f"Redis unavailable for idempotency key {key}: {e}. Using in-memory fallback.")
-            # In-memory fallback check
             if key in _in_memory_cache:
-                expires_at = _in_memory_cache[key]
-                if now < expires_at:
-                    logger.info(f"Duplicate webhook event detected and dropped via in-memory cache: {key}")
-                    return False
-            _in_memory_cache[key] = now + ttl_seconds
+                entry = _in_memory_cache[key]
+                if isinstance(entry, dict):
+                    status = entry.get("status")
+                    expires_at = entry.get("expires_at", 0)
+                    if status == "completed" and now < expires_at:
+                        return False
+                    if status == "processing" and now < expires_at:
+                        return False
+
+            _in_memory_cache[key] = {
+                "status": "processing",
+                "expires_at": now + processing_lease_seconds,
+            }
             return True
 
     @staticmethod
@@ -79,12 +93,42 @@ class IdempotencyService:
         event_id: str,
         ttl_seconds: int = 86400,
     ) -> None:
-        """Update event status to 'completed'."""
+        """Update event status to 'completed' with full 24-hour deduplication TTL."""
         if not event_id:
             return
         key = f"idempotency:{tenant_id}:{event_id}"
+        import time
         try:
             r = get_redis_client()
             await r.set(key, "completed", ex=ttl_seconds)
         except Exception as e:
             logger.warning(f"Failed to update idempotency status for {key}: {e}")
+        _in_memory_cache[key] = {
+            "status": "completed",
+            "expires_at": time.time() + ttl_seconds,
+        }
+
+    @staticmethod
+    async def release_event_lock(
+        tenant_id: str,
+        event_id: str,
+    ) -> None:
+        """
+        Releases the processing lock if an unhandled failure occurred,
+        allowing external provider webhook retries to be re-processed.
+        """
+        if not event_id:
+            return
+        key = f"idempotency:{tenant_id}:{event_id}"
+        try:
+            r = get_redis_client()
+            val = await r.get(key)
+            if val == "processing":
+                await r.delete(key)
+        except Exception as e:
+            logger.debug(f"Failed to release processing lock for {key}: {e}")
+
+        if key in _in_memory_cache:
+            entry = _in_memory_cache[key]
+            if isinstance(entry, dict) and entry.get("status") == "processing":
+                _in_memory_cache.pop(key, None)

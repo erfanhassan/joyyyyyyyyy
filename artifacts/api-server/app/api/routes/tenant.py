@@ -1,13 +1,13 @@
 import logging
 from typing import Optional, Dict, Any, List
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel, Field
 import uuid
 from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
-from app.db.models import Tenant, TenantIntegration, Order
+from app.db.models import Tenant, TenantIntegration, Order, User
 from app.core.security import encrypt_token, decrypt_token
 from app.services.telephony_service import TelephonyService, OutboundCallingUnavailable
 import httpx
@@ -55,9 +55,115 @@ class MetaSelectPageRequest(BaseModel):
     instagram_username: Optional[str] = None
 
 
+class OnboardRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=255, description="Business or storefront name")
+    currency: Optional[str] = Field("BDT", max_length=10)
+    timezone: Optional[str] = Field("Asia/Dhaka", max_length=50)
+    domain: Optional[str] = Field(None, max_length=255)
+
+
 # ==========================================
-# Tenant Profile Endpoints
+# Tenant Workspace Resolution & Profile
 # ==========================================
+@router.get("/me")
+async def get_my_workspace(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Dynamically resolves or provisions the workspace for the authenticated merchant/operator.
+    Falls back to the default storefront in local/offline development.
+    """
+    user_id = request.scope.get("state", {}).get("clerk_user_id")
+
+    tenant = None
+    if user_id:
+        stmt = (
+            select(Tenant)
+            .join(User, User.tenant_id == Tenant.id)
+            .where(User.email == user_id)
+        )
+        res = await db.execute(stmt)
+        tenant = res.scalar_one_or_none()
+
+    if not tenant:
+        res = await db.execute(select(Tenant).order_by(Tenant.created_at.asc()).limit(1))
+        tenant = res.scalar_one_or_none()
+
+    if not tenant:
+        tenant = Tenant(
+            name="My Storefront",
+            currency="BDT",
+            timezone="Asia/Dhaka",
+            domain=settings.DOMAIN or "joy.sonictch.com",
+        )
+        db.add(tenant)
+        await db.commit()
+        await db.refresh(tenant)
+
+    int_stmt = select(TenantIntegration).where(
+        TenantIntegration.tenant_id == tenant.id,
+        TenantIntegration.is_active == True,
+    )
+    int_res = await db.execute(int_stmt)
+    active_integrations = int_res.scalars().all()
+
+    return {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "currency": getattr(tenant, "currency", "BDT") or "BDT",
+        "timezone": getattr(tenant, "timezone", "Asia/Dhaka") or "Asia/Dhaka",
+        "domain": getattr(tenant, "domain", None),
+        "settings": getattr(tenant, "settings", {}) or {},
+        "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+        "active_integrations_count": len(active_integrations),
+        "configured_providers": [i.provider for i in active_integrations],
+        "role": "owner",
+    }
+
+
+@router.post("/onboard")
+async def onboard_merchant_workspace(
+    payload: OnboardRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Provisions a brand new isolated business workspace for an onboarding merchant.
+    """
+    user_id = request.scope.get("state", {}).get("clerk_user_id") or "owner@joy.sonictch.com"
+
+    new_tenant = Tenant(
+        name=payload.name.strip(),
+        currency=(payload.currency or "BDT").strip().upper(),
+        timezone=(payload.timezone or "Asia/Dhaka").strip(),
+        domain=payload.domain.strip() if payload.domain else None,
+    )
+    db.add(new_tenant)
+    await db.flush()
+
+    # Assign owner user
+    new_user = User(
+        tenant_id=new_tenant.id,
+        email=user_id,
+        full_name=payload.name.strip(),
+        role="owner",
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_tenant)
+
+    return {
+        "status": "success",
+        "id": str(new_tenant.id),
+        "name": new_tenant.name,
+        "currency": new_tenant.currency,
+        "timezone": new_tenant.timezone,
+        "domain": new_tenant.domain,
+        "message": "Business workspace created successfully.",
+    }
+
+
 @router.get("/{tenant_id}")
 async def get_tenant_profile(tenant_id: UUID, db: AsyncSession = Depends(get_db)):
     """Fetches real-time tenant profile, currency, and integration counts from PostgreSQL."""
@@ -71,7 +177,6 @@ async def get_tenant_profile(tenant_id: UUID, db: AsyncSession = Depends(get_db)
             detail=f"Tenant '{tenant_id}' not found in database.",
         )
 
-    # Count active integrations
     int_stmt = select(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant_id,
         TenantIntegration.is_active == True,
@@ -82,6 +187,10 @@ async def get_tenant_profile(tenant_id: UUID, db: AsyncSession = Depends(get_db)
     return {
         "id": str(tenant.id),
         "name": tenant.name,
+        "currency": getattr(tenant, "currency", "BDT") or "BDT",
+        "timezone": getattr(tenant, "timezone", "Asia/Dhaka") or "Asia/Dhaka",
+        "domain": getattr(tenant, "domain", None),
+        "settings": getattr(tenant, "settings", {}) or {},
         "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
         "active_integrations_count": len(active_integrations),
         "configured_providers": [i.provider for i in active_integrations],
@@ -94,7 +203,7 @@ async def update_tenant_profile(
     payload: TenantUpdate,
     db: AsyncSession = Depends(get_db),
 ):
-    """Updates the merchant's real business name, currency, and operational timezone."""
+    """Updates the merchant's real business name, currency, domain, and operational timezone."""
     stmt = select(Tenant).where(Tenant.id == tenant_id)
     result = await db.execute(stmt)
     tenant = result.scalar_one_or_none()
@@ -106,14 +215,24 @@ async def update_tenant_profile(
         )
 
     tenant.name = payload.name.strip()
+    if payload.currency:
+        tenant.currency = payload.currency.strip().upper()
+    if payload.timezone:
+        tenant.timezone = payload.timezone.strip()
+    if payload.domain is not None:
+        tenant.domain = payload.domain.strip() if payload.domain else None
+
     await db.commit()
     await db.refresh(tenant)
 
-    logger.info(f"Updated tenant {tenant_id} name to: {tenant.name}")
+    logger.info(f"Updated tenant {tenant_id} settings: name={tenant.name}, currency={tenant.currency}, tz={tenant.timezone}, domain={tenant.domain}")
     return {
         "status": "success",
         "id": str(tenant.id),
         "name": tenant.name,
+        "currency": tenant.currency,
+        "timezone": tenant.timezone,
+        "domain": tenant.domain,
         "message": "Store profile updated successfully.",
     }
 
@@ -316,6 +435,7 @@ async def meta_select_page(
         "instagram_account_id": payload.instagram_account_id or "",
         "instagram_username": payload.instagram_username or "",
         "requested_permissions": [
+            "pages_manage_metadata",
             "pages_show_list",
             "pages_read_engagement",
             "pages_manage_posts",
@@ -364,25 +484,46 @@ async def disconnect_tenant_integration(
     provider: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Disconnects and removes credentials for a provider from PostgreSQL."""
-    stmt = delete(TenantIntegration).where(
+    """
+    Disconnects integration, revokes/unsubscribes provider webhooks if applicable,
+    and removes credentials from PostgreSQL.
+    """
+    # Look up existing integration first to handle provider unsubscription
+    existing_stmt = select(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant_id,
         TenantIntegration.provider == provider,
     )
-    res = await db.execute(stmt)
-    await db.commit()
+    res_existing = await db.execute(existing_stmt)
+    existing_item = res_existing.scalars().first()
 
-    if res.rowcount == 0:
+    if not existing_item:
         raise HTTPException(
             status_code=404,
             detail=f"No active integration found for provider '{provider}'.",
         )
 
+    # If Meta, cleanly unsubscribe the Page from webhooks
+    if provider == "meta" and existing_item.access_token_encrypted:
+        try:
+            page_token = decrypt_token(existing_item.access_token_encrypted)
+            page_id = (existing_item.settings or {}).get("page_id")
+            if page_id and page_token:
+                await MetaAPIClient.unsubscribe_page_from_webhooks(page_id, page_token)
+        except Exception as e:
+            logger.warning(f"Error during Meta webhook unsubscription on disconnect: {e}")
+
+    stmt = delete(TenantIntegration).where(
+        TenantIntegration.tenant_id == tenant_id,
+        TenantIntegration.provider == provider,
+    )
+    await db.execute(stmt)
+    await db.commit()
+
     logger.info(f"Disconnected integration '{provider}' for tenant {tenant_id}")
     return {
         "status": "success",
         "provider": provider,
-        "message": f"{provider.capitalize()} integration successfully disconnected.",
+        "message": f"{provider.capitalize()} integration successfully disconnected and webhooks unsubscribed.",
     }
 
 

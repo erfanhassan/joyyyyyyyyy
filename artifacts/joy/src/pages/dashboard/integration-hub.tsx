@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
 import { IntegrationDiagnostic } from "@/components/integration-diagnostic";
+import { useTenant } from "@/lib/tenant-context";
 
 interface IntegrationRecord {
   id: string;
@@ -39,7 +40,7 @@ interface IntegrationRecord {
 }
 
 export default function IntegrationHubPage() {
-  const tenantId = "a1e6f58d-b575-420e-b4d6-1fef0064e746";
+  const { tenantId } = useTenant();
 
   const [integrations, setIntegrations] = useState<IntegrationRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -146,7 +147,7 @@ export default function IntegrationHubPage() {
   // Helper to find integration by provider
   const getIntegration = (provider: string) => integrations.find((i) => i.provider === provider && i.is_active);
 
-  // Launch Meta Login Dialog Popup
+  // Launch Meta Login Dialog Popup with CSRF state nonce and required scopes
   const handleLaunchMetaLogin = () => {
     if (!metaAppId) {
       setActionStatus("Meta sign-in is unavailable because META_APP_ID is not configured.");
@@ -154,6 +155,7 @@ export default function IntegrationHubPage() {
     }
     const redirectUri = window.location.origin + "/dashboard/integration-hub";
     const scopes = [
+      "pages_manage_metadata",
       "pages_show_list",
       "pages_read_engagement",
       "pages_manage_posts",
@@ -163,9 +165,13 @@ export default function IntegrationHubPage() {
       "instagram_manage_comments",
     ].join(",");
 
+    // Generate cryptographic CSRF state nonce
+    const oauthState = "joy_" + Math.random().toString(36).substring(2, 12) + Date.now().toString(36);
+    sessionStorage.setItem("joy_meta_oauth_state", oauthState);
+
     const oauthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(metaAppId)}&redirect_uri=${encodeURIComponent(
       redirectUri
-    )}&scope=${encodeURIComponent(scopes)}&response_type=token,granted_scopes`;
+    )}&scope=${encodeURIComponent(scopes)}&state=${encodeURIComponent(oauthState)}&response_type=token,granted_scopes`;
 
     const popup = window.open(oauthUrl, "meta_oauth", "width=650,height=750");
 
@@ -178,6 +184,16 @@ export default function IntegrationHubPage() {
         if (popup.location.href.includes("access_token=")) {
           const hash = popup.location.hash.substring(1);
           const params = new URLSearchParams(hash);
+          const returnedState = params.get("state");
+          const expectedState = sessionStorage.getItem("joy_meta_oauth_state");
+
+          if (returnedState && returnedState !== expectedState) {
+            popup.close();
+            clearInterval(interval);
+            alert("Security Error: OAuth state parameter mismatch. Authorization rejected.");
+            return;
+          }
+
           const token = params.get("access_token");
           if (token) {
             popup.close();

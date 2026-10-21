@@ -53,7 +53,32 @@ async def handle_widget_chat(
     if not req.message.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
 
-    tenant_uuid = UUID(req.tenant_id)
+    try:
+        tenant_uuid = UUID(req.tenant_id)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid tenant_id '{req.tenant_id}'. Must be a valid UUID.",
+        )
+
+    # Rate limiting: max 30 messages/minute per visitor
+    from app.services.idempotency import get_redis_client
+    redis = await get_redis_client()
+    if redis:
+        try:
+            rate_key = f"ratelimit:widget:{tenant_uuid}:{req.customer_id}"
+            count = await redis.incr(rate_key)
+            if count == 1:
+                await redis.expire(rate_key, 60)
+            if count > 30:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Message rate limit exceeded. Please wait a moment before sending more messages.",
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Redis rate limit check skipped: {e}")
 
     # 1. Get or create conversation record
     conv = await WidgetAPIService.get_or_create_conversation(
@@ -72,7 +97,30 @@ async def handle_widget_chat(
         message_text=req.message,
     )
 
-    # 3. Execute Social Sales Agent
+    # 3. Durable human takeover check: If human has taken over, do not run AI
+    if conv.is_paused_for_human:
+        from app.services.hitl_orchestrator import HITLOrchestrator
+        await HITLOrchestrator.broadcast_workbench_event(
+            tenant_uuid,
+            {
+                "type": "new_message",
+                "conversation_id": str(conv.id),
+                "tenant_id": str(tenant_uuid),
+                "sender_type": "customer",
+                "message_text": req.message,
+                "customer_identifier": req.customer_id,
+                "channel": "web_widget",
+                "is_paused_for_human": True,
+            },
+        )
+        return {
+            "status": "paused_for_human",
+            "conversation_id": str(conv.id),
+            "reply": "A customer support specialist has joined this chat and will be with you shortly.",
+            "is_paused_for_human": True,
+        }
+
+    # 4. Execute Social Sales Agent
     agent = SocialSalesAgent(db=db)
     initial_state = {
         "tenant_id": str(tenant_uuid),
@@ -82,6 +130,11 @@ async def handle_widget_chat(
         "message_text": req.message,
         "comment_id": None,
         "is_private_reply": False,
+        "page_access_token": None,
+        "store_domain": None,
+        "agent_active": True,
+        "system_prompt": None,
+        "tone_settings": None,
         "intent": None,
         "sentiment_score": 1.0,
         "risk_score": 0.0,
@@ -100,7 +153,7 @@ async def handle_widget_chat(
     final_state = await agent.execute(initial_state)
     reply_text = final_state.get("reply_text", "Thanks for reaching out! How can I assist you further?")
 
-    # 4. Update conversation state & log agent response
+    # 5. Update conversation state & log agent response
     conv.sentiment_score = final_state.get("sentiment_score", 1.0)
     conv.risk_score = final_state.get("risk_score", 0.0)
     conv.is_paused_for_human = final_state.get("is_paused_for_human", False)

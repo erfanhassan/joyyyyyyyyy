@@ -128,6 +128,17 @@ class MetaAPIClient:
                 return resp.json()
         except Exception as e:
             logger.warning(f"Could not auto-subscribe page {page_id} to webhooks: {e}")
+    @staticmethod
+    async def unsubscribe_page_from_webhooks(page_id: str, page_access_token: str) -> Dict[str, Any]:
+        """Unsubscribes Joy app from the Facebook Page's webhooks upon disconnect."""
+        url = f"{GRAPH_API_BASE}/{page_id}/subscribed_apps"
+        params = {"access_token": page_access_token}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.delete(url, params=params)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"Could not unsubscribe page {page_id} from webhooks: {e}")
             return {"success": False, "error": str(e)}
 
     @staticmethod

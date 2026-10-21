@@ -23,6 +23,7 @@ import {
   Power
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
+import { useTenant } from "@/lib/tenant-context";
 
 interface AgentRecord {
   id: string;
@@ -43,6 +44,7 @@ const TEMPLATES = [
     desc: "Validates photo proof of damages, verifies 7-day return policy, and dispatches courier pickup slips.",
     prompt: "You are the Returns and Exchange Specialist. Guide customers through replacement or store credit according to merchant return policy.",
     defaultDiscount: 0,
+    isRoadmap: true,
   },
   {
     type: "abandoned_cart",
@@ -50,6 +52,7 @@ const TEMPLATES = [
     desc: "Reaches out via WhatsApp or SMS within 30 minutes with personalized assistance and capped discounts.",
     prompt: "You are the Cart Recovery Concierge. Assist customers who abandoned their checkout with helpful product guidance and limited discount codes.",
     defaultDiscount: 10,
+    isRoadmap: true,
   },
   {
     type: "wholesale_inquiries",
@@ -57,11 +60,12 @@ const TEMPLATES = [
     desc: "Qualifies high-volume corporate and bulk buyer leads, collects VAT/TIN info, and schedules manager callbacks.",
     prompt: "You are the Wholesale B2B Executive. Collect buyer company information, estimated order volume, and schedule manager calls.",
     defaultDiscount: 15,
+    isRoadmap: true,
   },
 ];
 
 export default function EmployeeRosterPage() {
-  const tenantId = "a1e6f58d-b575-420e-b4d6-1fef0064e746";
+  const { tenantId } = useTenant();
 
   const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -459,7 +463,14 @@ export default function EmployeeRosterPage() {
                       }`}
                     >
                       <div className="flex items-center justify-between font-semibold text-foreground">
-                        <span>{tmpl.name}</span>
+                        <div className="flex items-center gap-2">
+                          <span>{tmpl.name}</span>
+                          {tmpl.isRoadmap && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200">
+                              Roadmap
+                            </span>
+                          )}
+                        </div>
                         {selectedTemplate === tmpl.type && <CheckCircle2 className="w-4 h-4 text-brand-600" />}
                       </div>
                       <p className="text-[11px] text-muted mt-1">{tmpl.desc}</p>

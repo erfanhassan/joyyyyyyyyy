@@ -33,6 +33,10 @@ class Tenant(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
+    currency = Column(String(10), default="BDT", nullable=True)
+    timezone = Column(String(50), default="Asia/Dhaka", nullable=True)
+    domain = Column(String(255), nullable=True)
+    settings = Column(JSONB, default=dict)
     created_at = Column(DateTime(timezone=True), default=get_utc_now)
 
     users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")

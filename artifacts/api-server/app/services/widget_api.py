@@ -90,15 +90,35 @@ class WidgetAPIService:
 
   var scriptTag = document.currentScript || (function() {{
     var scripts = document.getElementsByTagName('script');
+    for (var i = scripts.length - 1; i >= 0; i--) {{
+      if (scripts[i].getAttribute('data-tenant-id') || (scripts[i].src && scripts[i].src.indexOf('widget.js') !== -1)) {{
+        return scripts[i];
+      }}
+    }}
     return scripts[scripts.length - 1];
   }})();
 
-  var urlParams = new URL(scriptTag.src).searchParams;
-  var tenantId = urlParams.get('tenant_id') || 'default';
-  var apiBase = '{backend_base_url}';
+  var tenantId = (scriptTag && scriptTag.getAttribute('data-tenant-id')) || '';
+  if (!tenantId && scriptTag && scriptTag.src) {{
+    try {{
+      var urlParams = new URL(scriptTag.src).searchParams;
+      tenantId = urlParams.get('tenant_id') || '';
+    }} catch (e) {{}}
+  }}
 
+  var apiBase = '{backend_base_url}';
   var visitorId = localStorage.getItem('joy_visitor_id') || ('v_' + Math.random().toString(36).substr(2, 9));
   localStorage.setItem('joy_visitor_id', visitorId);
+
+  // Helper: Escape HTML to prevent XSS
+  function escapeHtml(str) {{
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }}
 
   // 1. Inject Styles
   var style = document.createElement('style');
@@ -180,7 +200,7 @@ class WidgetAPIService:
     if (!text) return;
     input.value = '';
 
-    // Append user message
+    // Append user message safely
     var userBubble = document.createElement('div');
     userBubble.className = 'joy-msg joy-msg-customer';
     userBubble.innerText = text;
@@ -201,7 +221,10 @@ class WidgetAPIService:
     .then(function(data) {{
       var agentBubble = document.createElement('div');
       agentBubble.className = 'joy-msg joy-msg-agent';
-      agentBubble.innerHTML = (data.reply || 'Thanks for reaching out!').replace(/\\n/g, '<br/>');
+      var rawReply = data.reply || 'Thanks for reaching out!';
+      var safeContent = escapeHtml(rawReply).replace(/\\n/g, '<br/>');
+      safeContent = safeContent.replace(/(https?:\\\/\\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#059669;text-decoration:underline;font-weight:600;">$1</a>');
+      agentBubble.innerHTML = safeContent;
       container.appendChild(agentBubble);
       container.scrollTop = container.scrollHeight;
     }})

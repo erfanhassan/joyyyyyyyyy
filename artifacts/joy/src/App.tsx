@@ -26,6 +26,7 @@ import IntegrationHubPage from '@/pages/dashboard/integration-hub';
 import KnowledgeBrainPage from '@/pages/dashboard/knowledge-brain';
 import EmployeeRosterPage from '@/pages/dashboard/employee-roster';
 import OperatorWorkbenchPage from '@/pages/dashboard/operator-workbench';
+import { TenantProvider } from './lib/tenant-context';
 
 const DEFAULT_TITLE = 'JOY - Multi-Tenant Digital Workforce Platform';
 const TITLES: Record<string, string> = {
@@ -253,15 +254,17 @@ function ClerkRoutes({ authRequired }: { authRequired: boolean | null }) {
 
 function Dashboard() {
   return (
-    <DashboardLayout>
-      <Switch>
-        <Route path="/dashboard/integration-hub" component={IntegrationHubPage} />
-        <Route path="/dashboard/knowledge-brain" component={KnowledgeBrainPage} />
-        <Route path="/dashboard/employee-roster" component={EmployeeRosterPage} />
-        <Route path="/dashboard/operator-workbench" component={OperatorWorkbenchPage} />
-        <Route component={NotFound} />
-      </Switch>
-    </DashboardLayout>
+    <TenantProvider>
+      <DashboardLayout>
+        <Switch>
+          <Route path="/dashboard/integration-hub" component={IntegrationHubPage} />
+          <Route path="/dashboard/knowledge-brain" component={KnowledgeBrainPage} />
+          <Route path="/dashboard/employee-roster" component={EmployeeRosterPage} />
+          <Route path="/dashboard/operator-workbench" component={OperatorWorkbenchPage} />
+          <Route component={NotFound} />
+        </Switch>
+      </DashboardLayout>
+    </TenantProvider>
   );
 }
 

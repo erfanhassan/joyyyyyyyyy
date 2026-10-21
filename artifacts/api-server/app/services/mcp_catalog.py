@@ -54,8 +54,10 @@ class MCPCatalogService:
     ) -> Dict[str, Any]:
         """
         MCP Tool: stock.check
-        Checks real-time inventory level and backorder status.
+        Checks real-time inventory level from knowledge catalog and connected store integrations.
+        Never fabricates availability when stock is 0 or unverified.
         """
+        import re
         logger.info(f"[MCP stock.check] tenant={tenant_id}, item='{sku_or_title}'")
         snippets = await RAGService.hybrid_query(
             db=db,
@@ -70,20 +72,70 @@ class MCPCatalogService:
                 "in_stock": False,
                 "quantity_available": 0,
                 "status": "not_found",
+                "message": "Product not found in store catalog.",
             }
 
         top_match = snippets[0]["content"]
-        # Extract stock numbers or default to in-stock
-        in_stock = "out of stock" not in top_match.lower()
-        # Simulated inventory reading
-        qty = 15 if in_stock else 0
+        lower_match = top_match.lower()
 
+        # 1. Explicit out of stock checks
+        explicit_out_of_stock = any(
+            phrase in lower_match
+            for phrase in [
+                "out of stock",
+                "sold out",
+                "stock: 0",
+                "qty: 0",
+                "quantity: 0",
+                "quantity 0",
+                "0 in stock",
+                "0 available",
+                "unavailable",
+                "backordered",
+            ]
+        )
+
+        if explicit_out_of_stock:
+            return {
+                "item": sku_or_title,
+                "in_stock": False,
+                "quantity_available": 0,
+                "status": "out_of_stock",
+                "matched_product": top_match[:150],
+                "message": "Item is currently out of stock.",
+            }
+
+        # 2. Extract numeric quantity if present
+        qty_match = re.search(r"(?:quantity|qty|stock|available)[\s:]*(\d+)", lower_match)
+        if qty_match:
+            qty = int(qty_match.group(1))
+            in_stock = qty > 0
+            return {
+                "item": sku_or_title,
+                "in_stock": in_stock,
+                "quantity_available": qty,
+                "status": "in_stock" if in_stock else "out_of_stock",
+                "matched_product": top_match[:150],
+            }
+
+        # 3. If explicit 'in stock' or 'available' is mentioned without numeric count
+        if "in stock" in lower_match or "available" in lower_match:
+            return {
+                "item": sku_or_title,
+                "in_stock": True,
+                "quantity_available": None,
+                "status": "available",
+                "matched_product": top_match[:150],
+            }
+
+        # 4. If stock is not verified from catalog, explicitly report unverified - NEVER invent availability
         return {
             "item": sku_or_title,
-            "in_stock": in_stock,
-            "quantity_available": qty,
-            "status": "available" if in_stock else "backordered",
+            "in_stock": False,
+            "quantity_available": 0,
+            "status": "unverified_inventory",
             "matched_product": top_match[:150],
+            "message": "Inventory availability cannot be verified from the catalog. Please confirm directly with store staff.",
         }
 
     @staticmethod
@@ -92,27 +144,41 @@ class MCPCatalogService:
         requested_discount_pct: int,
         max_discount_pct: int = 10,
         sku: Optional[str] = None,
+        store_domain: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         MCP Tool: discount.generate
         Generates a personalized discount coupon and checkout link, strictly capped
         by the merchant's agent_configs.max_discount_pct guardrail.
+        Uses the merchant's authoritative store domain instead of a fake endpoint.
         """
         # Guardrail: Never exceed merchant's configured maximum discount
         approved_pct = min(max(0, requested_discount_pct), max_discount_pct)
         
+        # Resolve real merchant domain
+        domain = (store_domain or "").strip()
+        if not domain or "checkout.joy.ai" in domain:
+            from app.core.config import settings
+            domain = getattr(settings, "DOMAIN", None) or "joy.sonictch.com"
+
+        if not domain.startswith("http://") and not domain.startswith("https://"):
+            domain = f"https://{domain}"
+
+        # Clean item parameter
+        item_param = sku.strip() if sku else "cart"
+
         # If customer asked for 0% or positive discount but max is 0
         if approved_pct <= 0:
             approved_pct = 0
             code = None
-            checkout_url = f"https://checkout.joy.ai/{tenant_id}?item={sku or 'cart'}"
+            checkout_url = f"{domain}/checkout?item={item_param}"
         else:
             random_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
             code = f"JOY{approved_pct}_{random_suffix}"
-            checkout_url = f"https://checkout.joy.ai/{tenant_id}?item={sku or 'cart'}&coupon={code}&discount={approved_pct}"
+            checkout_url = f"{domain}/checkout?item={item_param}&coupon={code}&discount={approved_pct}"
 
         logger.info(
-            f"[MCP discount.generate] requested={requested_discount_pct}%, approved={approved_pct}% (cap={max_discount_pct}%), code={code}"
+            f"[MCP discount.generate] requested={requested_discount_pct}%, approved={approved_pct}% (cap={max_discount_pct}%), code={code}, url={checkout_url}"
         )
 
         return {

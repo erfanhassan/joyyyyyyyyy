@@ -26,6 +26,13 @@ class SocialSalesState(TypedDict):
     message_text: str
     comment_id: Optional[str]
     is_private_reply: bool
+    page_access_token: Optional[str]
+    store_domain: Optional[str]
+
+    # Agent configuration
+    agent_active: bool
+    system_prompt: Optional[str]
+    tone_settings: Optional[Dict[str, Any]]
 
     # Intent & Risk Analysis
     intent: Optional[str]
@@ -66,6 +73,7 @@ class SocialSalesAgent:
     - Built with LangGraph state machine
     - Powered by DeepSeek API reasoning
     - Integrated with MCP Catalog and Meta Graph API
+    - Strictly enforces human takeover pause, agent activation, and merchant credentials
     """
 
     def __init__(self, db: AsyncSession):
@@ -86,7 +94,7 @@ class SocialSalesAgent:
         workflow.set_entry_point("parse_intent")
 
         def route_after_intent(state: SocialSalesState):
-            if state.get("is_paused_for_human"):
+            if not state.get("agent_active", True) or state.get("is_paused_for_human"):
                 return "hitl_takeover_pause"
             return "query_mcp_catalog"
 
@@ -113,23 +121,68 @@ class SocialSalesAgent:
     async def _parse_intent_node(self, state: SocialSalesState) -> Dict[str, Any]:
         """
         Node 1: Evaluates customer intent, sentiment, and risk using DeepSeek & SentimentService.
-        Enforces prompt injection defense and halts autonomy if risk > 0.70.
+        Enforces:
+        1. Agent activation check (agent_configs.is_active)
+        2. Durable human takeover (never resets if already paused)
+        3. Prompt injection defense and sentiment risk gating
         """
         raw_msg = state["message_text"]
+        tenant_uuid = UUID(state["tenant_id"])
 
-        # Fetch tenant config for discount cap
+        # 1. Fetch AgentConfig for employee status, custom prompt, tone, and discount cap
         max_discount_pct = 10
+        is_active = True
+        custom_prompt = None
+        tone_settings = None
+
         try:
             stmt = select(AgentConfig).where(
-                AgentConfig.tenant_id == UUID(state["tenant_id"]),
+                AgentConfig.tenant_id == tenant_uuid,
                 AgentConfig.agent_type == "social_sales",
             ).limit(1)
             res = await self.db.execute(stmt)
             cfg = res.scalars().first()
             if cfg:
                 max_discount_pct = cfg.max_discount_pct
+                is_active = cfg.is_active
+                custom_prompt = cfg.system_prompt
+                tone_settings = cfg.tone_settings
         except Exception as e:
             logger.warning(f"Failed to fetch AgentConfig for tenant {state['tenant_id']}: {e}")
+
+        # If agent is marked inactive by merchant, halt execution immediately
+        if not is_active:
+            logger.info(f"Social Sales Agent is marked inactive for tenant {tenant_uuid}. Halting execution.")
+            return {
+                "agent_active": False,
+                "is_paused_for_human": True,
+                "dispatch_status": "agent_inactive",
+                "max_discount_pct": max_discount_pct,
+                "system_prompt": custom_prompt,
+                "tone_settings": tone_settings,
+                "requested_discount_pct": 0,
+            }
+
+        # 2. Durable Human Takeover Check: verify database conversation status
+        is_already_paused = bool(state.get("is_paused_for_human", False))
+        conv = None
+        try:
+            conv_stmt = (
+                select(Conversation)
+                .where(
+                    Conversation.tenant_id == tenant_uuid,
+                    Conversation.customer_identifier == state["customer_id"],
+                    Conversation.channel == state["channel"],
+                )
+                .order_by(Conversation.updated_at.desc())
+                .limit(1)
+            )
+            conv_res = await self.db.execute(conv_stmt)
+            conv = conv_res.scalars().first()
+            if conv and conv.is_paused_for_human:
+                is_already_paused = True
+        except Exception as e:
+            logger.warning(f"Error querying conversation pause status: {e}")
 
         # Extract discount request percentage if mentioned
         discount_match = re.search(r"(\d{1,2})\s*%\s*(?:off|discount)?", raw_msg.lower())
@@ -140,9 +193,22 @@ class SocialSalesAgent:
         sentiment_score = sentiment_eval["sentiment_score"]
         risk_score = sentiment_eval["risk_score"]
         intent = sentiment_eval["intent"]
-        is_paused = sentiment_eval["is_risk_breached"] or (risk_score > 0.70)
+
+        # Critical: If already paused by operator, it MUST REMAIN paused.
+        # Only an explicit operator resume can reset is_paused_for_human to False.
+        if is_already_paused:
+            is_paused = True
+            logger.info(f"Conversation {state['customer_id']} is already paused for human operator. Retaining pause state.")
+        else:
+            is_paused = sentiment_eval["is_risk_breached"] or (risk_score > 0.70)
+            if is_paused and conv:
+                conv.is_paused_for_human = True
+                await self.db.commit()
 
         return {
+            "agent_active": True,
+            "system_prompt": custom_prompt,
+            "tone_settings": tone_settings,
             "intent": intent,
             "sentiment_score": sentiment_score,
             "risk_score": risk_score,
@@ -153,9 +219,16 @@ class SocialSalesAgent:
 
     async def _hitl_takeover_pause_node(self, state: SocialSalesState) -> Dict[str, Any]:
         """
-        Node: Pauses agent autonomy when sentiment risk > 0.70, preserving state in PostgreSQL.
+        Node: Handles halted automation (either employee marked inactive or human takeover active).
         """
-        logger.warning(f"Sentiment risk threshold breached (risk={state['risk_score']}). Halting AI autonomy for human takeover.")
+        if not state.get("agent_active", True):
+            return {
+                "reply_text": "",
+                "dispatch_status": "agent_inactive",
+                "is_paused_for_human": True,
+            }
+
+        logger.warning(f"Automation halted for human takeover (risk={state.get('risk_score')}). Preserving state in PostgreSQL.")
         handover_reply = "I understand your concern and want to make sure this is handled properly. I am connecting you with one of our store managers right now."
 
         # Broadcast real-time alert to Operator Workbench
@@ -202,7 +275,6 @@ class SocialSalesAgent:
 
         stock_info = None
         if catalog_results:
-            first_match = catalog_results[0]["content"]
             stock_info = await MCPCatalogService.stock_check(
                 db=self.db,
                 tenant_id=tenant_uuid,
@@ -216,7 +288,7 @@ class SocialSalesAgent:
 
     async def _validate_discount_node(self, state: SocialSalesState) -> Dict[str, Any]:
         """
-        Node 3: Validates discount requests against merchant cap and generates checkout link.
+        Node 3: Validates discount requests against merchant cap and generates real checkout link.
         """
         requested = state.get("requested_discount_pct", 0)
         max_allowed = state.get("max_discount_pct", 10)
@@ -226,6 +298,7 @@ class SocialSalesAgent:
             tenant_id=tenant_uuid,
             requested_discount_pct=requested,
             max_discount_pct=max_allowed,
+            store_domain=state.get("store_domain"),
         )
 
         return {
@@ -237,6 +310,7 @@ class SocialSalesAgent:
     async def _generate_sales_reply_node(self, state: SocialSalesState) -> Dict[str, Any]:
         """
         Node 4: Synthesizes high-conversion sales response with product details, stock, and coupon.
+        Applies merchant custom prompt and tone settings.
         """
         catalog = state.get("catalog_results", [])
         stock = state.get("stock_info")
@@ -245,6 +319,13 @@ class SocialSalesAgent:
         raw_msg = state["message_text"]
 
         catalog_text = "\n".join([f"- {c['content']}" for c in catalog]) if catalog else "General Store Catalog"
+
+        # Apply merchant custom system prompt & tone if configured
+        system_prompt = state.get("system_prompt") or SYSTEM_SALES_PROMPT
+        tone = state.get("tone_settings") or {}
+        formality = tone.get("formality", 0.5)
+        enthusiasm = tone.get("enthusiasm", 0.8)
+        tone_instruction = f"Tone guidance: formality level {formality:.1f} (0=casual, 1=formal), enthusiasm level {enthusiasm:.1f} (0=neutral, 1=excited)."
 
         # If DeepSeek is available, generate conversational message
         if settings.DEEPSEEK_API_KEY:
@@ -257,6 +338,7 @@ Stock Info: {stock}
 Approved Discount: {code} ({state.get('approved_discount_pct')}% off)
 Checkout Link: {checkout_url}
 
+{tone_instruction}
 Compose a friendly, high-conversion sales reply. Mention item availability, the discount code if approved, and the checkout link."""
 
                 async with httpx.AsyncClient(timeout=10.0) as client:
@@ -269,7 +351,7 @@ Compose a friendly, high-conversion sales reply. Mention item availability, the 
                         json={
                             "model": "deepseek-chat",
                             "messages": [
-                                {"role": "system", "content": SYSTEM_SALES_PROMPT},
+                                {"role": "system", "content": f"{system_prompt}\n{tone_instruction}"},
                                 {"role": "user", "content": prompt_content},
                             ],
                             "max_tokens": 200,
@@ -300,43 +382,56 @@ Compose a friendly, high-conversion sales reply. Mention item availability, the 
 
     async def _dispatch_channel_reply_node(self, state: SocialSalesState) -> Dict[str, Any]:
         """
-        Node 5: Dispatches reply to the appropriate channel (Meta DM, Comment Handshake, or Web Widget).
+        Node 5: Dispatches reply to the appropriate channel (Meta DM, Comment Handshake, or Web Widget)
+        using the merchant's stored encrypted page access token.
         """
         channel = state["channel"]
         reply_text = state["reply_text"]
         comment_id = state.get("comment_id")
+        page_token = state.get("page_access_token")
 
-        if channel == "instagram":
-            if state.get("is_private_reply") and comment_id:
-                # Meta 24-hr Handshake CTA
-                await MetaAPIClient.send_comment_to_dm_handshake(
-                    comment_id=comment_id,
-                    private_message_text=reply_text,
-                    cta_button_text="Claim Offer & Order",
-                )
-            else:
-                await MetaAPIClient.send_instagram_dm(
-                    recipient_id=state["customer_id"],
-                    message_text=reply_text,
-                )
-        elif channel == "facebook":
-            if state.get("is_private_reply") and comment_id:
-                await MetaAPIClient.send_comment_to_dm_handshake(
-                    comment_id=comment_id,
-                    private_message_text=reply_text,
-                    cta_button_text="Claim Offer & Order",
-                )
-            else:
-                await MetaAPIClient.send_facebook_messenger_dm(
-                    recipient_id=state["customer_id"],
-                    message_text=reply_text,
-                )
+        dispatch_res = {}
+        try:
+            if channel == "instagram":
+                if state.get("is_private_reply") and comment_id:
+                    dispatch_res = await MetaAPIClient.send_comment_to_dm_handshake(
+                        comment_id=comment_id,
+                        private_message_text=reply_text,
+                        cta_button_text="Claim Offer & Order",
+                        page_access_token=page_token,
+                    )
+                else:
+                    dispatch_res = await MetaAPIClient.send_instagram_dm(
+                        recipient_id=state["customer_id"],
+                        message_text=reply_text,
+                        page_access_token=page_token,
+                    )
+            elif channel == "facebook":
+                if state.get("is_private_reply") and comment_id:
+                    dispatch_res = await MetaAPIClient.send_comment_to_dm_handshake(
+                        comment_id=comment_id,
+                        private_message_text=reply_text,
+                        cta_button_text="Claim Offer & Order",
+                        page_access_token=page_token,
+                    )
+                else:
+                    dispatch_res = await MetaAPIClient.send_facebook_messenger_dm(
+                        recipient_id=state["customer_id"],
+                        message_text=reply_text,
+                        page_access_token=page_token,
+                    )
+        except Exception as e:
+            logger.error(f"Failed to dispatch channel reply: {e}")
+            return {"dispatch_status": f"failed: {str(e)}"}
 
-        return {"dispatch_status": "dispatched_successfully"}
+        return {"dispatch_status": "dispatched_successfully", "meta_response": dispatch_res}
 
     async def execute(self, initial_state: SocialSalesState, thread_id: Optional[str] = None) -> SocialSalesState:
-        """Run the LangGraph social sales state machine with PostgreSQL checkpoint persistence."""
-        tid = thread_id or initial_state.get("customer_id") or f"thread_{initial_state.get('tenant_id')}"
+        """
+        Run the LangGraph social sales state machine with PostgreSQL checkpoint persistence.
+        Guarantees scoped thread ID across business, channel, and customer identifier.
+        """
+        tid = thread_id or f"{initial_state['tenant_id']}:{initial_state.get('channel', 'social')}:{initial_state['customer_id']}"
         config = {
             "configurable": {
                 "thread_id": str(tid),

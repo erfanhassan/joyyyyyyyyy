@@ -59,6 +59,8 @@ const STEPS = [
   },
 ];
 
+import { useTenant } from "@/lib/tenant-context";
+
 export default function DashboardLayout({
   children,
 }: {
@@ -67,44 +69,34 @@ export default function DashboardLayout({
   const [pathname] = useLocation();
   const currentStep = STEPS.find((s) => s.href === pathname) || STEPS[0];
 
-  const tenantId = "a1e6f58d-b575-420e-b4d6-1fef0064e746";
+  const { tenant, tenantId, updateTenant } = useTenant();
   const [storeName, setStoreName] = useState<string>("My Storefront");
   const [currency, setCurrency] = useState<string>("BDT");
   const [timezone, setTimezone] = useState<string>("Asia/Dhaka");
-  const [storeDomain, setStoreDomain] = useState<string>("mystore.com");
+  const [storeDomain, setStoreDomain] = useState<string>("joy.sonictch.com");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
-  // Fetch real tenant profile from PostgreSQL
   useEffect(() => {
-    fetch(apiUrl(`/api/v1/tenant/${tenantId}`))
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.name) {
-          setStoreName(data.name);
-        }
-      })
-      .catch(() => {
-        // Fallback default
-        setStoreName("My Storefront");
-      });
-  }, [tenantId]);
+    if (tenant) {
+      if (tenant.name) setStoreName(tenant.name);
+      if (tenant.currency) setCurrency(tenant.currency);
+      if (tenant.timezone) setTimezone(tenant.timezone);
+      if (tenant.domain) setStoreDomain(tenant.domain);
+    }
+  }, [tenant]);
 
   const handleSaveStoreSettings = async () => {
     setIsSaving(true);
     try {
-      const res = await fetch(apiUrl(`/api/v1/tenant/${tenantId}`), {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: storeName,
-          currency: currency,
-          timezone: timezone,
-          domain: storeDomain,
-        }),
+      const success = await updateTenant({
+        name: storeName,
+        currency: currency,
+        timezone: timezone,
+        domain: storeDomain,
       });
-      if (res.ok) {
+      if (success) {
         setSaveSuccess(true);
         setTimeout(() => {
           setSaveSuccess(false);

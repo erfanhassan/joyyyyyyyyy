@@ -13,12 +13,258 @@ router = APIRouter(prefix="/meta", tags=["Meta Webhooks"])
 async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
     """
     Asynchronous background handler for Meta webhooks (comments, DMs, private replies).
+    Builds the complete production path:
+    Verified webhook → identify business/Page → save event → check human takeover →
+    run SocialSalesAgent → dispatch with Page credentials → record delivery result.
     """
     logger.info(f"[Meta Background Worker] Processing event {event_id} for tenant {tenant_id}")
-    # Receipt is not successful automation: this imported webhook has not yet
-    # been connected to the sales-agent worker. Never mark an unhandled event
-    # completed or imply that a reply was delivered.
-    logger.warning("Meta automation setup required: received event has no sales-agent dispatcher")
+    from uuid import UUID
+    from sqlalchemy import select
+    from app.db.session import AsyncSessionLocal
+    from app.db.models import Tenant, TenantIntegration, Conversation, InteractionLog, AgentConfig
+    from app.core.security import decrypt_token
+    from app.agents.social_sales import SocialSalesAgent
+    from app.services.hitl_orchestrator import HITLOrchestrator
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # 1. Identify Tenant and TenantIntegration
+            integration = None
+            tenant_uuid = None
+
+            if tenant_id and tenant_id != "default":
+                try:
+                    tenant_uuid = UUID(tenant_id)
+                    int_stmt = select(TenantIntegration).where(
+                        TenantIntegration.tenant_id == tenant_uuid,
+                        TenantIntegration.provider == "meta",
+                        TenantIntegration.is_active == True,
+                    ).limit(1)
+                    res = await db.execute(int_stmt)
+                    integration = res.scalars().first()
+                except ValueError:
+                    pass
+
+            # If not resolved via route parameter, match Page ID / Instagram ID from payload
+            if not integration:
+                entries = payload.get("entry", [])
+                for entry in entries:
+                    entry_id = str(entry.get("id", ""))
+                    if entry_id:
+                        int_stmt = select(TenantIntegration).where(
+                            TenantIntegration.provider == "meta",
+                            TenantIntegration.is_active == True,
+                        )
+                        res = await db.execute(int_stmt)
+                        all_meta = res.scalars().all()
+                        for item in all_meta:
+                            settings_dict = item.settings or {}
+                            if (
+                                str(settings_dict.get("page_id")) == entry_id
+                                or str(settings_dict.get("instagram_account_id")) == entry_id
+                            ):
+                                integration = item
+                                tenant_uuid = item.tenant_id
+                                break
+                    if integration:
+                        break
+
+            if not integration or not tenant_uuid:
+                logger.warning(f"No active Meta integration found matching event {event_id}. Event cannot be automated.")
+                return
+
+            # 2. Decrypt Page Access Token
+            page_token = None
+            if integration.access_token_encrypted:
+                try:
+                    page_token = decrypt_token(integration.access_token_encrypted)
+                except Exception as e:
+                    logger.error(f"Failed to decrypt Meta access token: {e}")
+                    return
+
+            page_settings = integration.settings or {}
+            ig_account_id = str(page_settings.get("instagram_account_id", ""))
+            fb_page_id = str(page_settings.get("page_id", ""))
+
+            # 3. Process Entries (Batched Payloads)
+            entries = payload.get("entry", [])
+            for entry in entries:
+                # 3A. Handle Direct Messages (DMs)
+                messaging_events = entry.get("messaging", [])
+                for msg_item in messaging_events:
+                    sender = msg_item.get("sender", {})
+                    recipient = msg_item.get("recipient", {})
+                    message = msg_item.get("message", {})
+
+                    # Skip echo messages (messages sent by the page/agent itself)
+                    if message.get("is_echo"):
+                        continue
+
+                    customer_id = sender.get("id")
+                    recipient_id = recipient.get("id")
+                    message_text = message.get("text")
+                    if not customer_id or not message_text:
+                        continue
+
+                    channel = "instagram" if (recipient_id == ig_account_id or customer_id == ig_account_id) else "facebook"
+
+                    # Get or create Conversation
+                    conv_stmt = (
+                        select(Conversation)
+                        .where(
+                            Conversation.tenant_id == tenant_uuid,
+                            Conversation.customer_identifier == customer_id,
+                            Conversation.channel == channel,
+                        )
+                        .order_by(Conversation.updated_at.desc())
+                        .limit(1)
+                    )
+                    conv_res = await db.execute(conv_stmt)
+                    conv = conv_res.scalars().first()
+
+                    if not conv:
+                        import uuid as uuid_pkg
+                        conv = Conversation(
+                            id=uuid_pkg.uuid4(),
+                            tenant_id=tenant_uuid,
+                            channel=channel,
+                            customer_identifier=customer_id,
+                            customer_name=f"Customer ({customer_id[:6]})",
+                            sentiment_score=1.0,
+                            risk_score=0.0,
+                            is_paused_for_human=False,
+                        )
+                        db.add(conv)
+                        await db.flush()
+
+                    # Save incoming customer interaction log
+                    cust_log = InteractionLog(
+                        tenant_id=tenant_uuid,
+                        conversation_id=conv.id,
+                        sender_type="customer",
+                        message_text=message_text,
+                        raw_payload=msg_item,
+                    )
+                    db.add(cust_log)
+                    await db.commit()
+
+                    # Durable Takeover Check: if human has taken over, do not run AI
+                    if conv.is_paused_for_human:
+                        logger.info(f"Conversation {conv.id} is paused for human takeover. Skipping autonomous AI reply.")
+                        await HITLOrchestrator.broadcast_workbench_event(
+                            tenant_uuid,
+                            {
+                                "type": "new_message",
+                                "conversation_id": str(conv.id),
+                                "tenant_id": str(tenant_uuid),
+                                "sender_type": "customer",
+                                "message_text": message_text,
+                                "customer_identifier": customer_id,
+                                "channel": channel,
+                                "is_paused_for_human": True,
+                            },
+                        )
+                        continue
+
+                    # Execute SocialSalesAgent
+                    agent = SocialSalesAgent(db=db)
+                    initial_state = {
+                        "tenant_id": str(tenant_uuid),
+                        "channel": channel,
+                        "customer_id": customer_id,
+                        "customer_name": conv.customer_name,
+                        "message_text": message_text,
+                        "comment_id": None,
+                        "is_private_reply": False,
+                        "page_access_token": page_token,
+                        "store_domain": None,
+                        "agent_active": True,
+                        "system_prompt": None,
+                        "tone_settings": None,
+                        "intent": None,
+                        "sentiment_score": 1.0,
+                        "risk_score": 0.0,
+                        "is_paused_for_human": False,
+                        "catalog_results": [],
+                        "stock_info": None,
+                        "max_discount_pct": 10,
+                        "requested_discount_pct": 0,
+                        "approved_discount_pct": 0,
+                        "discount_code": None,
+                        "checkout_url": None,
+                        "reply_text": "",
+                        "dispatch_status": "pending",
+                    }
+
+                    final_state = await agent.execute(initial_state)
+
+                    # Save outgoing agent interaction log
+                    if final_state.get("reply_text"):
+                        agent_log = InteractionLog(
+                            tenant_id=tenant_uuid,
+                            conversation_id=conv.id,
+                            sender_type="agent",
+                            message_text=final_state["reply_text"],
+                            raw_payload=final_state,
+                        )
+                        db.add(agent_log)
+                        await db.commit()
+
+                # 3B. Handle Feed & Post/Reel Comments
+                changes_events = entry.get("changes", [])
+                for change in changes_events:
+                    val = change.get("value", {})
+                    if val.get("item") == "comment" and val.get("verb") in ("add", None):
+                        comment_id = val.get("comment_id")
+                        comment_msg = val.get("message")
+                        sender_id = val.get("from", {}).get("id")
+                        sender_name = val.get("from", {}).get("name")
+
+                        # Don't reply to comments made by the Page itself
+                        if not comment_id or not comment_msg or sender_id in (fb_page_id, ig_account_id):
+                            continue
+
+                        channel = "instagram" if entry.get("id") == ig_account_id else "facebook"
+
+                        agent = SocialSalesAgent(db=db)
+                        initial_state = {
+                            "tenant_id": str(tenant_uuid),
+                            "channel": channel,
+                            "customer_id": sender_id,
+                            "customer_name": sender_name,
+                            "message_text": comment_msg,
+                            "comment_id": comment_id,
+                            "is_private_reply": True,
+                            "page_access_token": page_token,
+                            "store_domain": None,
+                            "agent_active": True,
+                            "system_prompt": None,
+                            "tone_settings": None,
+                            "intent": None,
+                            "sentiment_score": 1.0,
+                            "risk_score": 0.0,
+                            "is_paused_for_human": False,
+                            "catalog_results": [],
+                            "stock_info": None,
+                            "max_discount_pct": 10,
+                            "requested_discount_pct": 0,
+                            "approved_discount_pct": 0,
+                            "discount_code": None,
+                            "checkout_url": None,
+                            "reply_text": "",
+                            "dispatch_status": "pending",
+                        }
+
+                        await agent.execute(initial_state)
+
+            # Mark processed in idempotency service
+            await IdempotencyService.mark_event_completed(str(tenant_uuid), event_id)
+            logger.info(f"Successfully processed Meta event {event_id} for tenant {tenant_uuid}")
+
+        except Exception as e:
+            logger.error(f"Error processing Meta background webhook {event_id}: {e}", exc_info=True)
+            if tenant_uuid:
+                await IdempotencyService.release_event_lock(str(tenant_uuid), event_id)
 
 
 @router.get("")

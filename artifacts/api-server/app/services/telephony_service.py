@@ -149,5 +149,98 @@ class TelephonyService:
         tenant_id: UUID,
         merchant_name: str = "Joy Store",
     ) -> Dict[str, Any]:
-        """Never report an initiated call when no SIP participant was dialed."""
-        TelephonyService.require_outbound_calling()
+        """
+        Initiates outbound AI phone confirmation call via LiveKit SIP trunk.
+        Provisions a LiveKit room with order context metadata and dispatches SIP dialing.
+        """
+        if not settings.LIVEKIT_URL or not settings.LIVEKIT_API_KEY or not settings.LIVEKIT_API_SECRET:
+            raise OutboundCallingUnavailable("LiveKit credentials (URL, API Key, API Secret) are not configured.")
+
+        room_name = f"order-call-{order_id}"
+        livekit_url = settings.LIVEKIT_URL.replace("wss://", "https://").replace("ws://", "http://")
+
+        # 1. Generate Admin Token for Twirp APIs
+        token = generate_livekit_token(
+            api_key=settings.LIVEKIT_API_KEY,
+            api_secret=settings.LIVEKIT_API_SECRET,
+            room_name=room_name,
+            participant_identity=f"agent-{order_id}",
+            participant_name="Joy Voice Agent",
+        )
+
+        metadata_dict = {
+            "order_id": str(order_id),
+            "tenant_id": str(tenant_id),
+            "customer_phone": customer_phone,
+            "customer_name": customer_name,
+            "shipping_address": shipping_address,
+            "order_items": order_items,
+            "order_total": order_total,
+            "merchant_name": merchant_name,
+        }
+
+        # 2. Create LiveKit Room
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                room_resp = await client.post(
+                    f"{livekit_url}/twirp/livekit.RoomService/CreateRoom",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "name": room_name,
+                        "empty_timeout": 300,
+                        "max_participants": 5,
+                        "metadata": json.dumps(metadata_dict),
+                    },
+                )
+                if room_resp.status_code != 200:
+                    logger.error(f"LiveKit CreateRoom returned {room_resp.status_code}: {room_resp.text}")
+                    raise OutboundCallingUnavailable(f"LiveKit CreateRoom failed ({room_resp.status_code}): {room_resp.text}")
+            except Exception as e:
+                if isinstance(e, OutboundCallingUnavailable):
+                    raise
+                logger.error(f"Failed to communicate with LiveKit RoomService: {e}")
+                raise OutboundCallingUnavailable(f"Could not reach LiveKit: {e}")
+
+            # 3. Create SIP Outbound Participant if AmberIT is configured
+            if not (settings.AMBERIT_SIP_SERVER and settings.AMBERIT_SIP_PHONE):
+                raise OutboundCallingUnavailable("SIP Trunk (AmberIT) credentials are not fully configured.")
+
+            sip_call_id = f"sip_{order_id}"
+            try:
+                sip_resp = await client.post(
+                    f"{livekit_url}/twirp/livekit.SIP/CreateSIPParticipant",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "sip_call_to": customer_phone,
+                        "room_name": room_name,
+                        "participant_identity": f"customer-{customer_phone}",
+                        "participant_name": customer_name,
+                    },
+                )
+                if sip_resp.status_code == 200:
+                    sip_data = sip_resp.json()
+                    sip_call_id = sip_data.get("participant_id") or sip_call_id
+                    logger.info(f"LiveKit SIP outbound participant created: {sip_call_id}")
+                else:
+                    logger.error(f"LiveKit SIP dispatch returned {sip_resp.status_code}: {sip_resp.text}")
+                    raise OutboundCallingUnavailable(f"LiveKit SIP dispatch failed ({sip_resp.status_code}): {sip_resp.text}")
+            except Exception as e:
+                if isinstance(e, OutboundCallingUnavailable):
+                    raise
+                logger.error(f"SIP participant dispatch attempt error: {e}")
+                raise OutboundCallingUnavailable(f"SIP dispatch error: {e}")
+
+        logger.info(f"Initiated outbound voice confirmation call {sip_call_id} for order {order_id} in room {room_name}")
+        return {
+            "status": "calling_initiated",
+            "call_id": sip_call_id,
+            "room_name": room_name,
+            "provider": "livekit_amberit",
+            "customer_phone": customer_phone,
+        }
