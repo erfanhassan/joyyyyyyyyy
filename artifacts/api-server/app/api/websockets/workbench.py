@@ -4,7 +4,7 @@ import logging
 from typing import Dict, Set, Optional, List
 from uuid import UUID
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db, AsyncSessionLocal
@@ -250,6 +250,21 @@ class HumanReplyRequest(BaseModel):
     operator_name: Optional[str] = "Operator"
 
 
+class WhatsAppConsentRequest(BaseModel):
+    tenant_id: UUID
+    conversation_id: UUID
+    opted_in: bool
+    source: Optional[str] = Field(None, max_length=255)
+
+
+class WhatsAppTemplateSendRequest(BaseModel):
+    tenant_id: UUID
+    conversation_id: UUID
+    name: str = Field(..., min_length=1, max_length=512)
+    language: str = Field(..., min_length=1, max_length=32)
+    variables: List[str] = Field(default_factory=list, max_length=20)
+
+
 class SimulateRiskRequest(BaseModel):
     tenant_id: UUID
     customer_message: str
@@ -293,6 +308,10 @@ async def list_workbench_conversations(
             "risk_score": c.risk_score,
             "risk_badge": badge,
             "is_paused_for_human": c.is_paused_for_human,
+            "whatsapp_opt_in": c.whatsapp_opt_in,
+            "whatsapp_opt_in_updated_at": c.whatsapp_opt_in_updated_at.isoformat()
+            if c.whatsapp_opt_in_updated_at else None,
+            "whatsapp_opt_in_source": c.whatsapp_opt_in_source,
             "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         })
     return {"conversations": items}
@@ -358,6 +377,140 @@ async def send_human_reply(
         operator_name=req.operator_name or "Operator",
         db=db,
     )
+
+
+@router.post("/workbench/whatsapp/consent")
+async def update_whatsapp_consent(
+    req: WhatsAppConsentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Record or revoke a workspace operator's recorded customer opt-in."""
+    from datetime import datetime, timezone
+
+    if req.opted_in and not (req.source and req.source.strip()):
+        raise HTTPException(400, "Record where the customer gave opt-in before enabling template messages.")
+    conversation = (await db.execute(select(Conversation).where(
+        Conversation.tenant_id == req.tenant_id,
+        Conversation.id == req.conversation_id,
+        Conversation.channel == "whatsapp",
+    ))).scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(404, "WhatsApp conversation not found.")
+
+    source = req.source.strip()[:255] if req.opted_in and req.source else None
+    conversation.whatsapp_opt_in = req.opted_in
+    conversation.whatsapp_opt_in_updated_at = datetime.now(timezone.utc)
+    conversation.whatsapp_opt_in_source = source
+    consent_log = InteractionLog(
+        tenant_id=req.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="human_operator",
+        message_text=("WhatsApp customer opt-in recorded" if req.opted_in
+                      else "WhatsApp customer opt-in revoked"),
+        raw_payload={
+            "event_type": "whatsapp_consent",
+            "opted_in": req.opted_in,
+            "source": source,
+        },
+    )
+    db.add(consent_log)
+    await db.flush()
+    message_id = str(consent_log.id)
+    await db.commit()
+    await HITLOrchestrator.broadcast_workbench_event(req.tenant_id, {
+        "type": "new_message",
+        "tenant_id": str(req.tenant_id),
+        "conversation_id": str(conversation.id),
+        "sender_type": "human_operator",
+        "message_text": ("WhatsApp customer opt-in recorded" if req.opted_in
+                         else "WhatsApp customer opt-in revoked"),
+        "message_id": message_id,
+    })
+    return {
+        "opted_in": conversation.whatsapp_opt_in,
+        "updated_at": conversation.whatsapp_opt_in_updated_at.isoformat(),
+        "source": conversation.whatsapp_opt_in_source,
+        "message_id": message_id,
+    }
+
+
+@router.get("/workbench/conversations/{tenant_id}/{conversation_id}/whatsapp/templates")
+async def list_whatsapp_templates(
+    tenant_id: UUID,
+    conversation_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    conversation = (await db.execute(select(Conversation).where(
+        Conversation.tenant_id == tenant_id,
+        Conversation.id == conversation_id,
+        Conversation.channel == "whatsapp",
+    ))).scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(404, "WhatsApp conversation not found.")
+    from app.services.whatsapp import WhatsAppService
+    try:
+        templates = await WhatsAppService.approved_templates(db, tenant_id)
+    except Exception as error:
+        raise HTTPException(502, str(error)) from None
+    return {"templates": templates}
+
+
+@router.post("/workbench/whatsapp/template")
+async def send_whatsapp_template(
+    req: WhatsAppTemplateSendRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a freshly verified, approved template only after recorded customer opt-in."""
+    conversation = (await db.execute(select(Conversation).where(
+        Conversation.tenant_id == req.tenant_id,
+        Conversation.id == req.conversation_id,
+        Conversation.channel == "whatsapp",
+    ))).scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(404, "WhatsApp conversation not found.")
+
+    from app.services.whatsapp import WhatsAppService
+    try:
+        result, template = await WhatsAppService.send_template(
+            db, conversation, req.name, req.language, req.variables)
+    except PermissionError as error:
+        raise HTTPException(403, str(error)) from None
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
+    except Exception as error:
+        raise HTTPException(502, str(error)) from None
+
+    provider_message_id = result["messages"][0]["id"]
+    summary = f"WhatsApp template sent: {template['name']} ({template['language']})"
+    log_entry = InteractionLog(
+        tenant_id=req.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="human_operator",
+        message_text=summary,
+        raw_payload={
+            "dispatch_status": "dispatched_whatsapp_template",
+            "provider_message_id": provider_message_id,
+            "template_name": template["name"],
+            "template_language": template["language"],
+            "template_variables": req.variables,
+        },
+    )
+    db.add(log_entry)
+    await db.commit()
+    await HITLOrchestrator.broadcast_workbench_event(req.tenant_id, {
+        "type": "new_message",
+        "tenant_id": str(req.tenant_id),
+        "conversation_id": str(conversation.id),
+        "sender_type": "human_operator",
+        "message_text": summary,
+        "message_id": str(log_entry.id),
+    })
+    return {
+        "status": "accepted",
+        "provider_message_id": provider_message_id,
+        "message_id": str(log_entry.id),
+        "message_text": summary,
+    }
 
 
 @router.post("/workbench/simulate-sentiment-alert")

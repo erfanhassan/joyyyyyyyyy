@@ -82,6 +82,8 @@ def test_verified_owner_can_reach_protected_auth_endpoint(production_client, mon
     monkeypatch.setattr(settings, "CLERK_PUBLISHABLE_KEY", "test-only-publishable-key")
     monkeypatch.setattr(settings, "JOY_INITIAL_ADMIN_EMAIL", "owner@example.test")
     monkeypatch.setattr(settings, "META_APP_ID", "test-meta-app-id")
+    monkeypatch.setattr(settings, "META_LOGIN_CONFIG_ID", "")
+    monkeypatch.setattr(settings, "WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID", "")
 
     async def owner(_scope):
         return {"user_id": "user_test"}

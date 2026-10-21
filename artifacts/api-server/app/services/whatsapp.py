@@ -1,4 +1,5 @@
-"""WhatsApp Cloud API: verified phone bindings and customer-initiated text replies."""
+"""WhatsApp Cloud API: verified phone bindings, replies, and approved templates."""
+import re
 import time
 from uuid import UUID
 import httpx
@@ -10,6 +11,96 @@ from app.services.meta_credentials import MetaCredentialError, credential_error,
 
 
 class WhatsAppService:
+    @staticmethod
+    async def integration(db, tenant_id):
+        record = (await db.execute(select(TenantIntegration).where(
+            TenantIntegration.tenant_id == tenant_id,
+            TenantIntegration.provider == "whatsapp",
+            TenantIntegration.is_active.is_(True)))).scalar_one_or_none()
+        if not record:
+            raise RuntimeError("WhatsApp is disconnected.")
+        if (record.settings or {}).get("connection_status") == "needs_reconnect":
+            from app.services.webhook_jobs import ManualReviewRequired
+            raise ManualReviewRequired("WhatsApp needs reconnection before another message can be sent.")
+        return record
+
+    @staticmethod
+    def template_layout(template):
+        """Return supported text-parameter locations in WhatsApp send order."""
+        components = template.get("components") or []
+        layout = []
+        supported = True
+        for component in components:
+            kind = str(component.get("type", "")).lower()
+            if kind == "header":
+                if component.get("format", "TEXT").upper() != "TEXT":
+                    supported = False
+                    continue
+                text = component.get("text") or ""
+                count = len(re.findall(r"\{\{\s*\d+\s*\}\}", text))
+                if count:
+                    layout.append({"type": "header", "count": count})
+            elif kind == "body":
+                text = component.get("text") or ""
+                count = len(re.findall(r"\{\{\s*\d+\s*\}\}", text))
+                if count:
+                    layout.append({"type": "body", "count": count})
+            elif kind == "buttons":
+                for index, button in enumerate(component.get("buttons") or []):
+                    if str(button.get("type", "")).upper() == "URL":
+                        count = len(re.findall(r"\{\{\s*\d+\s*\}\}", button.get("url") or ""))
+                        if count:
+                            layout.append({"type": "button", "index": str(index), "count": count})
+        return layout, supported
+
+    @staticmethod
+    def template_variables_count(template):
+        layout, _ = WhatsAppService.template_layout(template)
+        return sum(item["count"] for item in layout)
+
+    @staticmethod
+    def template_components(layout, variables):
+        if len(variables) != sum(item["count"] for item in layout):
+            raise ValueError(f"This template requires exactly {sum(item['count'] for item in layout)} variable(s).")
+        if any(not isinstance(value, str) or not value.strip() for value in variables):
+            raise ValueError("Every required template variable must have a value.")
+        result = []
+        offset = 0
+        for item in layout:
+            params = [
+                {"type": "text", "text": str(value).strip()}
+                for value in variables[offset:offset + item["count"]]
+            ]
+            offset += item["count"]
+            if item["type"] == "button":
+                result.append({
+                    "type": "button", "sub_type": "url", "index": item["index"],
+                    "parameters": params,
+                })
+            else:
+                result.append({"type": item["type"], "parameters": params})
+        return result
+
+    @staticmethod
+    async def approved_templates(db, tenant_id):
+        record = await WhatsAppService.integration(db, tenant_id)
+        token = decrypt_token(record.access_token_encrypted)
+        templates = await WhatsAppService.api(
+            token, "GET", f"{record.settings['waba_id']}/message_templates",
+            params={"fields": "name,status,language,category,components", "limit": 100},
+        )
+        return [
+            {
+                "name": item["name"],
+                "language": item.get("language", "en"),
+                "category": item.get("category"),
+                "variable_count": WhatsAppService.template_variables_count(item),
+                "supported": WhatsAppService.template_layout(item)[1],
+            }
+            for item in templates.get("data", [])
+            if item.get("status") == "APPROVED" and item.get("name") and item.get("language")
+        ]
+
     @staticmethod
     async def api(token, method, path, **kwargs):
         if not path or any(part in path for part in ("..", "://", "?")):
@@ -73,6 +164,45 @@ class WhatsAppService:
         if not result.get("messages", [{}])[0].get("id"):
             raise RuntimeError("WhatsApp did not confirm message acceptance.")
         return result
+
+    @staticmethod
+    async def send_template(db, conversation, name, language, variables):
+        if conversation.whatsapp_opt_in is not True:
+            raise PermissionError("A recorded customer WhatsApp opt-in is required before sending a template.")
+        record = await WhatsAppService.integration(db, conversation.tenant_id)
+        token = decrypt_token(record.access_token_encrypted)
+        approved = await WhatsAppService.api(
+            token, "GET", f"{record.settings['waba_id']}/message_templates",
+            params={"fields": "name,status,language,category,components", "name": name, "limit": 100},
+        )
+        template = next((item for item in approved.get("data", [])
+                         if item.get("name") == name and item.get("language") == language
+                         and item.get("status") == "APPROVED"), None)
+        if not template:
+            raise PermissionError("This WhatsApp template is not currently approved for this language.")
+        layout, supported = WhatsAppService.template_layout(template)
+        if not supported:
+            raise ValueError("This template uses a media header, which is not supported for sending here.")
+        components = WhatsAppService.template_components(layout, variables)
+        try:
+            result = await WhatsAppService.api(token, "POST",
+                f"{record.settings['phone_number_id']}/messages", json={
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": conversation.customer_identifier,
+                    "type": "template",
+                    "template": {
+                        "name": name,
+                        "language": {"code": language},
+                        "components": components,
+                    },
+                })
+        except MetaCredentialError as error:
+            mark_reconnect_required(record, error.channel)
+            raise
+        if not result.get("messages", [{}])[0].get("id"):
+            raise RuntimeError("WhatsApp did not confirm template message acceptance.")
+        return result, template
 
 
 async def enqueue_whatsapp(payload, route_tenant):

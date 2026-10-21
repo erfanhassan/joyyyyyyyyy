@@ -166,7 +166,8 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
     <h2 className="font-semibold">WhatsApp Business</h2>
     <p className="my-2 text-sm text-muted-foreground">
       Connect an official Cloud API number. Meta Embedded Signup can securely authorize and return the business account and phone number.
-      JOY supports customer-initiated text replies within Meta’s 24-hour window; template messages and campaigns are not enabled.
+      JOY supports customer-initiated replies within Meta’s 24-hour window and approved templates from the Workbench when customer opt-in is recorded.
+      Bulk campaigns are not enabled.
     </p>
     <p className="mb-3 text-sm">{needsReconnect
       ? "Reconnect required — WhatsApp replies are paused"

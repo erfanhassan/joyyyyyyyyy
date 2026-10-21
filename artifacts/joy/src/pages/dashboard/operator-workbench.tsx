@@ -34,6 +34,9 @@ interface ConversationItem {
   risk_score: number;
   risk_badge?: "green_safe" | "yellow_warning" | "crimson_alert";
   is_paused_for_human: boolean;
+  whatsapp_opt_in?: boolean;
+  whatsapp_opt_in_updated_at?: string;
+  whatsapp_opt_in_source?: string | null;
   updated_at?: string;
   latest_message?: string;
 }
@@ -44,6 +47,14 @@ interface MessageItem {
   message_text: string;
   created_at?: string;
   raw_payload?: any;
+}
+
+interface WhatsAppTemplate {
+  name: string;
+  language: string;
+  category?: string;
+  variable_count: number;
+  supported: boolean;
 }
 
 export default function OperatorWorkbenchPage() {
@@ -57,9 +68,20 @@ export default function OperatorWorkbenchPage() {
   const [alertBanner, setAlertBanner] = useState<any | null>(null);
   const [simulationStatus, setSimulationStatus] = useState<string | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
+  const [whatsappTemplates, setWhatsappTemplates] = useState<WhatsAppTemplate[]>([]);
+  const [selectedTemplateKey, setSelectedTemplateKey] = useState("");
+  const [templateVariables, setTemplateVariables] = useState<string[]>([]);
+  const [templateBusy, setTemplateBusy] = useState(false);
+  const [templateNotice, setTemplateNotice] = useState("");
+  const [consentSource, setConsentSource] = useState("");
+  const [consentBusy, setConsentBusy] = useState(false);
 
   const { tenantId } = useTenant();
   const wsRef = useRef<WebSocket | null>(null);
+  const activeConversation = conversations.find((c) => c.id === selectedConvId) || conversations[0];
+  const selectedTemplate = whatsappTemplates.find(
+    (template) => `${template.name}:${template.language}` === selectedTemplateKey
+  );
 
   // Fetch conversations function
   const fetchConversations = () => {
@@ -127,14 +149,16 @@ export default function OperatorWorkbenchPage() {
             );
           } else if (payload.type === "new_message") {
             if (payload.conversation_id === selectedConvId) {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: `msg-${Date.now()}`,
+              setMessages((prev) => {
+                if (payload.message_id && prev.some((message) => message.id === payload.message_id)) {
+                  return prev;
+                }
+                return [...prev, {
+                  id: payload.message_id || `msg-${Date.now()}`,
                   sender_type: payload.sender_type,
                   message_text: payload.message_text,
-                },
-              ]);
+                }];
+              });
             }
           }
         } catch (e) {
@@ -172,7 +196,114 @@ export default function OperatorWorkbenchPage() {
     setAiDraft("Hello, I am checking your order details with the warehouse right now. One moment please.");
   }, [selectedConvId, tenantId]);
 
-  const activeConversation = conversations.find((c) => c.id === selectedConvId) || conversations[0];
+  useEffect(() => {
+    if (!tenantId || !selectedConvId || activeConversation?.channel !== "whatsapp") {
+      setWhatsappTemplates([]);
+      setSelectedTemplateKey("");
+      setTemplateVariables([]);
+      return;
+    }
+    let cancelled = false;
+    setWhatsappTemplates([]);
+    setSelectedTemplateKey("");
+    setTemplateVariables([]);
+    setTemplateNotice("");
+    fetch(apiUrl(`/api/v1/workbench/conversations/${tenantId}/${selectedConvId}/whatsapp/templates`))
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Could not load approved WhatsApp templates.");
+        if (!cancelled) setWhatsappTemplates(data.templates || []);
+      })
+      .catch((error) => {
+        if (!cancelled) setTemplateNotice(error instanceof Error ? error.message : "Could not load approved WhatsApp templates.");
+      });
+    return () => { cancelled = true; };
+  }, [tenantId, selectedConvId, activeConversation?.channel]);
+
+  useEffect(() => {
+    setConsentSource(activeConversation?.whatsapp_opt_in_source || "");
+  }, [activeConversation?.id, activeConversation?.whatsapp_opt_in_source]);
+
+  const handleRecordWhatsAppConsent = async (optedIn: boolean) => {
+    if (!activeConversation || (optedIn && !consentSource.trim())) {
+      setTemplateNotice("Enter where the customer gave opt-in before recording consent.");
+      return;
+    }
+    setConsentBusy(true);
+    setTemplateNotice("");
+    try {
+      const response = await fetch(apiUrl("/api/v1/workbench/whatsapp/consent"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tenant_id: tenantId,
+          conversation_id: activeConversation.id,
+          opted_in: optedIn,
+          source: optedIn ? consentSource.trim() : null,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Could not update WhatsApp consent.");
+      setConversations((previous) => previous.map((conversation) =>
+        conversation.id === activeConversation.id
+          ? {
+              ...conversation,
+              whatsapp_opt_in: data.opted_in,
+              whatsapp_opt_in_updated_at: data.updated_at,
+              whatsapp_opt_in_source: data.source,
+            }
+          : conversation
+      ));
+      setTemplateNotice(optedIn ? "Customer opt-in recorded." : "Customer opt-in revoked.");
+      setMessages((previous) => previous.some((message) => message.id === data.message_id)
+        ? previous
+        : [...previous, {
+            id: data.message_id,
+            sender_type: "human_operator",
+            message_text: optedIn ? "WhatsApp customer opt-in recorded" : "WhatsApp customer opt-in revoked",
+          }]);
+    } catch (error) {
+      setTemplateNotice(error instanceof Error ? error.message : "Could not update WhatsApp consent.");
+    } finally {
+      setConsentBusy(false);
+    }
+  };
+
+  const handleSendWhatsAppTemplate = async () => {
+    if (!activeConversation || !selectedTemplate || !activeConversation.whatsapp_opt_in) return;
+    if (templateVariables.some((variable) => !variable.trim())) {
+      setTemplateNotice("Fill in each required template variable before sending.");
+      return;
+    }
+    setTemplateBusy(true);
+    setTemplateNotice("");
+    try {
+      const response = await fetch(apiUrl("/api/v1/workbench/whatsapp/template"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tenant_id: tenantId,
+          conversation_id: activeConversation.id,
+          name: selectedTemplate.name,
+          language: selectedTemplate.language,
+          variables: templateVariables,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "WhatsApp template could not be sent.");
+      setMessages((previous) => [...previous, {
+        id: data.message_id,
+        sender_type: "human_operator",
+        message_text: data.message_text,
+      }]);
+      setTemplateVariables(Array(selectedTemplate.variable_count).fill(""));
+      setTemplateNotice("WhatsApp accepted the approved template for delivery.");
+    } catch (error) {
+      setTemplateNotice(error instanceof Error ? error.message : "WhatsApp template could not be sent.");
+    } finally {
+      setTemplateBusy(false);
+    }
+  };
 
   const handleToggleTakeover = async (takeOver: boolean) => {
     if (!activeConversation) return;
@@ -621,6 +752,85 @@ export default function OperatorWorkbenchPage() {
 
           {/* Operator Reply Input */}
           <div className="p-4 border-t border-border bg-white">
+            {activeConversation?.channel === "whatsapp" && (
+              <div className="mb-4 rounded-lg border border-border bg-surface/60 p-3 space-y-3">
+                <div>
+                  <h4 className="text-xs font-bold text-foreground">WhatsApp customer consent</h4>
+                  {activeConversation.whatsapp_opt_in ? (
+                    <>
+                      <p className="mt-1 text-[11px] text-muted">
+                        Opt-in recorded{activeConversation.whatsapp_opt_in_source
+                          ? ` from ${activeConversation.whatsapp_opt_in_source}` : ""}.
+                      </p>
+                      <button type="button" onClick={() => void handleRecordWhatsAppConsent(false)}
+                        disabled={consentBusy}
+                        className="mt-2 rounded-md border border-border px-2.5 py-1.5 text-[11px] font-semibold disabled:opacity-50">
+                        {consentBusy ? "Saving…" : "Revoke opt-in"}
+                      </button>
+                    </>
+                  ) : (
+                    <div className="mt-2 flex gap-2">
+                      <input value={consentSource} onChange={(event) => setConsentSource(event.target.value)}
+                        maxLength={255} placeholder="Where did the customer opt in?"
+                        className="min-w-0 flex-1 rounded-md border border-border bg-white px-2.5 py-1.5 text-[11px]" />
+                      <button type="button" onClick={() => void handleRecordWhatsAppConsent(true)}
+                        disabled={consentBusy || !consentSource.trim()}
+                        className="rounded-md bg-foreground px-2.5 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">
+                        Record opt-in
+                      </button>
+                    </div>
+                  )}
+                  {!activeConversation.whatsapp_opt_in && (
+                    <p className="mt-1.5 text-[10px] text-muted">
+                      Only record this after the customer has explicitly agreed to receive WhatsApp messages.
+                    </p>
+                  )}
+                </div>
+
+                <div className="border-t border-border pt-3">
+                  <h4 className="text-xs font-bold text-foreground">Send an approved template</h4>
+                  <select value={selectedTemplateKey}
+                    onChange={(event) => {
+                      const template = whatsappTemplates.find(
+                        (item) => `${item.name}:${item.language}` === event.target.value
+                      );
+                      setSelectedTemplateKey(event.target.value);
+                      setTemplateVariables(Array(template?.variable_count || 0).fill(""));
+                    }}
+                    className="mt-2 w-full rounded-md border border-border bg-white px-2.5 py-2 text-[11px]"
+                    disabled={!activeConversation.whatsapp_opt_in || templateBusy}>
+                    <option value="">Choose an approved template</option>
+                    {whatsappTemplates.map((template) => (
+                      <option key={`${template.name}:${template.language}`}
+                        value={`${template.name}:${template.language}`} disabled={!template.supported}>
+                        {template.name} · {template.language}{template.supported ? "" : " · media header not supported"}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedTemplate && Array.from({ length: selectedTemplate.variable_count }, (_, index) => (
+                    <input key={index} value={templateVariables[index] || ""}
+                      onChange={(event) => setTemplateVariables((previous) => previous.map((value, variableIndex) =>
+                        variableIndex === index ? event.target.value : value
+                      ))}
+                      maxLength={1024} placeholder={`Template variable ${index + 1}`}
+                      className="mt-2 w-full rounded-md border border-border bg-white px-2.5 py-2 text-[11px]" />
+                  ))}
+                  <button type="button" onClick={() => void handleSendWhatsAppTemplate()}
+                    disabled={!activeConversation.whatsapp_opt_in || !selectedTemplate?.supported || templateBusy
+                      || templateVariables.some((variable) => !variable.trim())}
+                    className="mt-2 w-full rounded-md bg-foreground px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-40">
+                    {templateBusy ? "Sending…" : "Send approved template"}
+                  </button>
+                  {!activeConversation.whatsapp_opt_in && (
+                    <p className="mt-1.5 text-[10px] text-muted">Record customer opt-in to enable template sending.</p>
+                  )}
+                  {!whatsappTemplates.length && !templateNotice && (
+                    <p className="mt-1.5 text-[10px] text-muted">No approved templates are available for this WhatsApp account.</p>
+                  )}
+                  {templateNotice && <p role="status" className="mt-1.5 text-[10px] text-muted">{templateNotice}</p>}
+                </div>
+              </div>
+            )}
             <div className="flex items-center gap-2">
               <input
                 type="text"

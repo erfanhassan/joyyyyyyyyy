@@ -129,6 +129,9 @@ class Conversation(Base):
     sentiment_score = Column(Float, default=1.0)
     risk_score = Column(Float, default=0.0)
     is_paused_for_human = Column(Boolean, default=False)
+    whatsapp_opt_in = Column(Boolean, nullable=False, default=False)
+    whatsapp_opt_in_updated_at = Column(DateTime(timezone=True), nullable=True)
+    whatsapp_opt_in_source = Column(String(255), nullable=True)
     updated_at = Column(DateTime(timezone=True), default=get_utc_now, onupdate=get_utc_now)
 
     tenant = relationship("Tenant", back_populates="conversations")
