@@ -1,7 +1,13 @@
 ---
-name: GitHub repository permissions
-description: Distinguish repository access from destructive repository-management permissions when using Replit's GitHub connections.
+name: GitHub access and synchronization
+description: Canonical JOY repository, remote verification, and distinctions between API and Git transport permissions.
 ---
+
+Use `https://github.com/erfanhassan/joyyyyyyyyy` as JOY's main source repository, not the old `project-joy` repository.
+
+**Why:** The user explicitly confirmed that `joyyyyyyyyy` is the main repository.
+
+**How to apply:** Verify the active workspace's `origin` before fetching or pulling. Do not assume a repository-switch task updated the parent workspace's Git configuration: one such task was merged while the active remote still pointed to the old repository. Preserve local commits when merging upstream updates.
 
 Do not infer Git transport authentication or repository-deletion permission from a successful GitHub API read or an `admin: true` repository permissions field. Replit's GitHub API connection can manage repository content while its configured OAuth scopes still block repository deletion; the workspace Git CLI may also lack credentials even when a GitHub source-control connection is active.
 

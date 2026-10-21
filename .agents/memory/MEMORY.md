@@ -1,3 +1,3 @@
 - [Migration boundaries](migration-boundaries.md) — preserve the imported Python backend and original design; the empty database scaffold is not authoritative.
 - [HTTP proxy encoding](http-proxy-encoding.md) — preserve compressed bytes and Content-Encoding together; successful health checks do not prove browser scripts can execute.
-- [GitHub repository permissions](github-repository-permissions.md) — repository admin visibility does not guarantee the connected OAuth app can delete repositories or authenticate Git CLI pushes.
+- [GitHub access and sync](github-repository-permissions.md) — canonical JOY repository, active remote verification, and limits of GitHub API versus Git transport permissions.
