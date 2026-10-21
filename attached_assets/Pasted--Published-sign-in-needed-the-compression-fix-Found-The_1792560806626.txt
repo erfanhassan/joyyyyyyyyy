@@ -1,0 +1,141 @@
+. Published sign-in needed the compression fix
+Found: The sign-in proxy corrupted compressed JavaScript, causing the white screen.
+Status: Fixed in the source code, with regression checks. Full owner-session access on the corrected published build still needs confirmation.
+Production fix: Publish the corrected build, then verify actual owner sign-in, dashboard access, sign-out, expired sessions, and unauthorized accounts.
+2. JOY is currently owner-only—not a multi-merchant platform
+Found: Access is restricted to the configured owner, and dashboard pages use a fixed store identifier. Signing up does not create a separate merchant workspace.
+Production fix:
+Create a business workspace during onboarding.
+Associate users with that workspace.
+Add owner/admin/operator roles and invitations.
+Resolve the permitted workspace on the server—not from a hardcoded frontend value.
+Meta approval will not implement this automatically.
+3. Tenant isolation needs stronger enforcement
+Found: PostgreSQL row-level security is enabled, which is good. However, tenant context comes from request parameters and uses session-level database state. Body-only routes and reused connections need careful handling.
+Risk: This is not sufficient assurance for safely opening the app to multiple businesses.
+Production fix: Validate workspace membership first, use transaction-local tenant context, and test cross-business access using restricted database roles.
+2. Social Sales Specialist: what is not working
+4. Incoming Meta messages do not reach the sales agent
+Found: The Meta webhook receives events, but its background handler does not invoke the Social Sales Specialist.
+Result: A successful Meta webhook verification does not mean automatic replies work.
+Production fix: Build the complete path:
+Verified webhook → identify business/Page → save event → queue processing → load conversation → run agent → send reply → record delivery result.
+It must handle individual events in batched webhook payloads—not just acknowledge the request.
+5. Outgoing messages are not wired to the merchant’s Page credentials
+Found: Sales-agent and operator-reply calls do not supply the stored Page access token to the messaging client.
+Result: Even after connecting a Page, the sending path is incomplete.
+Production fix: Every send must resolve the correct business, channel, Page/Instagram account, and encrypted credential. Record the actual provider message ID and failure response.
+6. Meta onboarding is incomplete
+Found:
+The requested permissions omit pages_manage_metadata, although the app attempts to subscribe to feed events.
+The popup authorization flow lacks a proper OAuth state check.
+Token expiry, permission loss, and reconnect handling are incomplete.
+Production fix: Implement nonce-bound OAuth, verified redirects, server-side exchanges where appropriate, actual granted-permission checks, and a clear reconnect flow.
+Meta documents the Page webhook permission requirements [here](https://developers.facebook.com/documentation/pages-api/webhooks-for-pages.md).
+7. Stock checking is simulated
+Confirmed by an offline probe: A source stating inventory quantity 0 was reported as in stock, quantity 15.
+Production fix: Read authoritative stock by product variant/SKU from Shopify, WooCommerce, or another inventory system. If stock cannot be verified, say so—never invent availability.
+8. Coupons and checkout links are not real merchant transactions
+Found: The discount percentage cap works, but coupon codes are generated locally. Checkout links point to a hardcoded checkout.joy.ai address rather than a real merchant cart.
+Result: The agent can offer a coupon that does not exist and a checkout link that does not complete the intended purchase.
+Production fix:
+Create valid discounts through the merchant’s authorized API.
+Build a real cart/checkout containing the correct variants and quantities.
+Validate price, currency, availability, and discount eligibility.
+Count a sale only after an authoritative order event—not after generating a link.
+9. Employee settings are not fully applied during execution
+Found: Configuration can be saved, but the sales runtime mainly reads the discount cap. Activation, custom prompt, tone, and operating rules are not consistently enforced.
+Production fix: Load and validate the complete effective configuration before processing and again before sending. An employee marked inactive must not send messages.
+10. Human takeover does not reliably stop the AI
+Confirmed by an offline probe: A conversation already paused for a human still executed the agent, and the request could reset the pause to false.
+Production fix: Make human takeover a durable conversation state. Check it before generation and immediately before sending. Only an explicit authorized resume action should restart automation.
+This is a launch blocker.
+11. Conversation memory is not sufficiently scoped
+Found: Agent checkpoint keys use the customer identifier without consistently including the business and channel.
+Risk: Different conversations could collide when identifiers are reused.
+Production fix: Scope memory using business ID, provider account, channel, and conversation ID.
+12. Human replies can be saved without being delivered
+Confirmed by an offline probe: When the provider send failed, the reply endpoint still returned overall success, with dispatch status logged.
+Production fix: Separate:
+Saved
+Queued
+Accepted by provider
+Delivered/read, where supported
+Failed
+The inbox must not make “saved locally” look like “sent to the customer.”
+3. Knowledge Brain: confirmed problems
+13. The upload area is not connected to an upload action
+Found: The visible “click or drag and drop” area has no working file-selection/upload wiring.
+Production fix: Connect it to the upload API, show genuine progress, validate files, and display processing failures.
+14. The document library displays hardcoded documents
+Found: The UI shows example PDFs and a crawled website, while production contains zero knowledge documents.
+Production fix: Fetch the library from the database. Add real document listing, indexing status, reindexing, and deletion.
+15. Search results use the wrong response field
+Confirmed in the browser: The API returns snippets; the UI reads results. A genuine test result was ignored and replaced with a hardcoded Panjabi answer.
+Production fix: Align the API contract and frontend types. Remove fabricated fallback answers.
+16. Failed crawling can appear successful
+Confirmed in the browser: An HTTP 500 response was displayed as “Success! Generated 12 vector chunks.”
+The exception handler also contains another simulated-success message.
+Production fix: Check HTTP status, display real errors, and show success only after indexing has committed successfully.
+17. Embedding failures silently fall back to synthetic vectors
+Found: Failed OpenAI embedding requests can produce deterministic hash-based vectors instead.
+Risk: Production search can silently become inaccurate, especially when synthetic and genuine embeddings are mixed.
+Production fix: Fail or retry the indexing job explicitly. Track embedding model/version and mark documents searchable only after valid indexing.
+18. Website crawling is not a complete inventory integration
+Found: The crawler extracts a page’s text. That does not provide reliable live variants, stock, prices, or complete product coverage.
+Production fix: Use store APIs for transactional product data. Use crawling/documents for descriptions, policies, FAQs, and supporting knowledge.
+4. Website widget and storefront integration
+19. The copied widget snippet and widget script disagree
+Found: The dashboard supplies data-tenant-id, but the widget reads a URL query parameter instead.
+Result: It can fall back to default, which the chat endpoint rejects as an invalid UUID.
+Production fix: Use one tested configuration format and verify the exact copy-and-paste snippet on an external website.
+20. The widget has security and abuse risks
+Found:
+Agent output is inserted through unsanitized innerHTML.
+The public chat path lacks adequate tenant-specific abuse controls and verified visitor sessions.
+Production fix: Safely render text/links, validate the installation domain, issue scoped visitor sessions, and add rate limits, message limits, and spending caps.
+21. Shopify/WooCommerce/custom order handlers are unfinished
+Found: Their background handlers acknowledge events and can mark them completed without normalizing orders or starting the confirmation workflow.
+Production fix: Verify the sender, map the correct store, persist the event and order, and enqueue the appropriate action. Only mark processing complete after successful work.
+22. Store write-back can falsely report simulated synchronization
+Found:
+Order synchronization falls back to synced_simulated.
+WooCommerce uses a Bearer-token pattern that does not match the consumer-key/secret setup collected by JOY.
+Shopify uses an old hardcoded REST API path.
+Production fix: Load the real stored credentials, use supported authentication/APIs, preserve existing merchant data, and expose retryable failures instead of simulated success.
+For a new public Shopify integration, use the [GraphQL Admin API](https://shopify.dev/docs/api/admin-rest/2026-07.md). WooCommerce documents its key/secret authentication [here](https://developer.woocommerce.com/docs/apis/rest-api/authentication/).
+5. Phone Confirmation Specialist
+23. Actual outbound dialing is not implemented
+Found: There is no completed AmberIT trunk → LiveKit SIP participant → customer dialing flow.
+Current behavior: Calling is deliberately blocked rather than reporting a fake dispatch.
+Production fix: Implement and verify a real outbound SIP trunk and call state machine.
+24. The voice-agent worker is missing
+Found: Configuring speech-model names does not create a running conversational voice worker.
+Production fix: Deploy a worker that handles audio, speech recognition, responses, speech output, interruptions, silence, timeouts, and hangups.
+25. The call-completion path is not provider-ready
+Found: The completion endpoint is protected by owner-session authentication, and the simulator’s payload does not match the endpoint’s required order-based contract.
+Production fix: Create a signed provider callback with call/order mapping, replay protection, idempotency, and validated state transitions.
+26. WhatsApp/SMS fallback is not implemented
+Found: The older fallback path changes fields and constructs a placeholder verification URL; it does not actually send a WhatsApp/SMS message.
+Production fix: Send through a real messaging adapter using consent and applicable templates. Confirmation links must be signed, expiring, and bound to the correct order.
+My AmberIT recommendation
+Use:
+JOY web/API → durable job queue → voice worker + LiveKit SIP → AmberIT → customer
+Keep SIP/media handling outside the normal web-request lifecycle. Confirm AmberIT’s authentication, registration, network/IP, and geographic requirements first. If necessary, use an Asterisk/FreeSWITCH gateway hosted where AmberIT permits it.
+Before launch, add calling consent, permitted hours, retry limits, opt-outs, and recording/transcript retention rules. Do not promise a particular latency until measured.
+6. Dashboard, reliability, and compliance
+27. Simulators can show success after failed requests
+The workbench contains success messages that do not consistently check the HTTP result. A simulated call completion is not a real phone call.
+Fix: Isolate demos from production data and display actual outcomes.
+28. “Hiring” additional employee types only saves configurations
+Returns, cart recovery, and wholesale templates do not have corresponding complete execution workflows.
+Fix: Label these as unavailable until implemented. Do not sell them as functioning automation.
+29. Background processing is not durable
+Webhook work uses in-process background tasks. Redis failure falls back to process memory, and processing locks can cause retries to be discarded after a failure.
+Fix: Persist webhook receipts before acknowledging them; use durable jobs, processing leases, retries, dead-letter handling, and idempotent side effects.
+30. Some settings and privacy claims do not match behavior
+Examples:
+Currency/timezone/domain fields are accepted, but the profile update only persists the name.
+Disconnecting Meta deletes the local integration record but does not implement the claimed full provider-unsubscription/deletion lifecycle.
+Some sensitive provider settings are stored in generic settings JSON rather than the encrypted credential fields.
+Fix: Persist settings properly, separate and encrypt secrets, implement revocation/deletion workflows, and make privacy statements match reality.
