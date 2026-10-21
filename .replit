@@ -77,3 +77,5 @@ packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "postgres
 
 [userenv.shared]
 JOY_INITIAL_ADMIN_EMAIL = "e.h.ifti@gmail.com"
+META_LOGIN_CONFIG_ID = "935054449441104"
+WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID = "1423530453086604"
