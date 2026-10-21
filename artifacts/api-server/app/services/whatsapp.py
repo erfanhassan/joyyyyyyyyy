@@ -14,7 +14,7 @@ class WhatsAppService:
         if not path or any(part in path for part in ("..", "://", "?")):
             raise ValueError("Invalid WhatsApp resource.")
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-            result = await client.request(method, f"https://graph.facebook.com/v24.0/{path}",
+            result = await client.request(method, f"https://graph.facebook.com/v26.0/{path}",
                 headers={"Authorization": f"Bearer {token}"}, **kwargs)
             data = result.json()
             if result.status_code >= 300 or data.get("error"):

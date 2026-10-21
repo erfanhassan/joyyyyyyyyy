@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.db.models import Tenant, TenantIntegration, Order, User
 from app.core.security import encrypt_token, decrypt_token
+from app.core.config import settings
 from app.services.telephony_service import TelephonyService, OutboundCallingUnavailable
 import httpx
 import time
@@ -44,7 +45,12 @@ class IntegrationTestRequest(BaseModel):
 class MetaOAuthExchangeRequest(BaseModel):
     code: Optional[str] = None
     access_token: Optional[str] = None
-    redirect_uri: Optional[str] = "http://localhost:3000/dashboard/integration-hub"
+
+
+class WhatsAppEmbeddedSignupRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=4096)
+    waba_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9]+$")
+    phone_number_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9]+$")
 
 
 class MetaSelectPageRequest(BaseModel):
@@ -374,6 +380,47 @@ async def save_tenant_integration(
     }
 
 
+@router.post("/{tenant_id}/integrations/whatsapp/embedded-signup")
+async def finish_whatsapp_embedded_signup(
+    tenant_id: UUID,
+    payload: WhatsAppEmbeddedSignupRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange Embedded Signup's short-lived code server-side; never expose the resulting token to the browser."""
+    if not settings.META_APP_ID or not settings.META_APP_SECRET:
+        raise HTTPException(503, "Meta app credentials are not configured on the server.")
+    try:
+        token_data = await MetaAPIClient.exchange_code_for_user_token(payload.code)
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise RuntimeError("Meta did not return an access token.")
+        result = await save_tenant_integration(
+            tenant_id,
+            IntegrationConnectRequest(
+                provider="whatsapp",
+                access_token=access_token,
+                settings={
+                    "waba_id": payload.waba_id,
+                    "phone_number_id": payload.phone_number_id,
+                },
+            ),
+            db,
+        )
+        result["message"] = (
+            "WhatsApp account verified and connected. Inbound delivery still depends on "
+            "the JOY Meta app's webhook callback and WhatsApp fields being configured."
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("WhatsApp Embedded Signup verification failed for tenant %s", tenant_id)
+        raise HTTPException(
+            400,
+            "WhatsApp signup could not be verified. Confirm the Meta configuration, selected WABA and phone number, and required permissions.",
+        ) from None
+
+
 @router.post("/{tenant_id}/integrations/meta/oauth-exchange")
 async def meta_oauth_exchange(
     tenant_id: UUID,
@@ -389,7 +436,6 @@ async def meta_oauth_exchange(
         if payload.code:
             token_data = await MetaAPIClient.exchange_code_for_user_token(
                 code=payload.code,
-                redirect_uri=payload.redirect_uri or "http://localhost:3000/dashboard/integration-hub",
             )
             user_token = token_data.get("access_token")
 
@@ -471,7 +517,7 @@ async def meta_select_page(
             "pages_manage_metadata",
             "pages_show_list",
             "pages_read_engagement",
-            "pages_manage_posts",
+            "pages_manage_engagement",
             "pages_messaging",
             "instagram_basic",
             "instagram_manage_messages",

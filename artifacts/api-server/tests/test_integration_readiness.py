@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.routes import tenant as routes
+from app.api.webhooks.meta import get_or_create_meta_conversation
 from app.core.config import settings
 from app.services.meta_api import MetaAPIClient
 from app.services.telephony_service import TelephonyService
@@ -96,6 +97,52 @@ async def test_meta_requires_successful_webhook_subscription(monkeypatch):
     assert error.value.status_code == 400
     db.add.assert_not_called()
     db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_meta_comment_gets_conversation_without_any_dm_event():
+    tenant_id = uuid4()
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=Mock(scalars=Mock(return_value=Mock(first=Mock(return_value=None))))),
+        add=Mock(),
+        flush=AsyncMock(),
+    )
+
+    conversation = await get_or_create_meta_conversation(
+        db, tenant_id, "commenter-123", "instagram", "Customer Name",
+    )
+
+    assert conversation.tenant_id == tenant_id
+    assert conversation.customer_identifier == "commenter-123"
+    assert conversation.channel == "instagram"
+    assert conversation.customer_name == "Customer Name"
+    db.add.assert_called_once_with(conversation)
+    db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_embedded_signup_exchanges_code_without_returning_access_token(monkeypatch):
+    monkeypatch.setattr(settings, "META_APP_ID", "test-app-id")
+    monkeypatch.setattr(settings, "META_APP_SECRET", "test-app-secret")
+    exchange = AsyncMock(return_value={"access_token": "server-only-access-token"})
+    save = AsyncMock(return_value={"status": "success", "provider": "whatsapp", "connected": True})
+    monkeypatch.setattr(MetaAPIClient, "exchange_code_for_user_token", exchange)
+    monkeypatch.setattr(routes, "save_tenant_integration", save)
+    payload = routes.WhatsAppEmbeddedSignupRequest(
+        code="short-lived-code",
+        waba_id="123456789",
+        phone_number_id="987654321",
+    )
+
+    result = await routes.finish_whatsapp_embedded_signup(uuid4(), payload, object())
+
+    exchange.assert_awaited_once_with("short-lived-code")
+    assert save.await_args.args[1].settings == {
+        "waba_id": "123456789",
+        "phone_number_id": "987654321",
+    }
+    assert "access_token" not in result
+    assert "server-only-access-token" not in str(result)
 
 
 @pytest.mark.asyncio

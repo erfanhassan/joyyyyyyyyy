@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.core.deployment_guard import is_public_deployment
 
 logger = logging.getLogger("joy.meta_api")
-GRAPH_API_VERSION = "v24.0"
+GRAPH_API_VERSION = "v26.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
@@ -49,13 +49,12 @@ class MetaAPIClient:
             raise RuntimeError("Meta did not confirm delivery. Check the Page access token, approved permissions and messaging window.")
 
     @staticmethod
-    async def exchange_code_for_user_token(code: str, redirect_uri: str) -> Dict[str, Any]:
+    async def exchange_code_for_user_token(code: str) -> Dict[str, Any]:
         """Exchanges an OAuth authorization code for a user access token."""
         url = f"{GRAPH_API_BASE}/oauth/access_token"
         params = {
             "client_id": settings.META_APP_ID,
             "client_secret": settings.META_APP_SECRET,
-            "redirect_uri": redirect_uri,
             "code": code,
         }
         async with httpx.AsyncClient(timeout=15.0) as client:

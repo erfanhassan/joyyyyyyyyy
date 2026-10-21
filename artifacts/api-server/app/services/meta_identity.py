@@ -10,7 +10,7 @@ async def token_owner(token):
     # Do not allow httpx's informational request logger to print those URLs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     async with httpx.AsyncClient(timeout=12) as client:
-        response = await client.get("https://graph.facebook.com/v24.0/debug_token",
+        response = await client.get("https://graph.facebook.com/v26.0/debug_token",
             headers={"Authorization": f"Bearer {settings.META_APP_ID}|{settings.META_APP_SECRET}"},
             params={"input_token": token})
         data = response.json().get("data", {})

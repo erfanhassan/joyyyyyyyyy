@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     # Social Channels (Meta Graph API)
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
+    META_LOGIN_CONFIG_ID: str = ""
+    WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID: str = ""
     META_VERIFY_TOKEN: str = "joy_meta_verify_token_default"
 
     # Storefront Integrations

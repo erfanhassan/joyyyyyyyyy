@@ -10,6 +10,44 @@ logger = logging.getLogger("joy.webhooks.meta")
 router = APIRouter(prefix="/meta", tags=["Meta Webhooks"])
 
 
+async def get_or_create_meta_conversation(db, tenant_uuid, customer_id: str, channel: str, customer_name=None):
+    """Resolve a channel-specific conversation for an incoming Meta message or comment."""
+    from uuid import uuid4
+    from sqlalchemy import select
+    from app.db.models import Conversation
+
+    customer_id = str(customer_id)
+    result = await db.execute(
+        select(Conversation)
+        .where(
+            Conversation.tenant_id == tenant_uuid,
+            Conversation.customer_identifier == customer_id,
+            Conversation.channel == channel,
+        )
+        .order_by(Conversation.updated_at.desc())
+        .limit(1)
+    )
+    conversation = result.scalars().first()
+    if conversation:
+        if customer_name and not conversation.customer_name:
+            conversation.customer_name = customer_name
+        return conversation
+
+    conversation = Conversation(
+        id=uuid4(),
+        tenant_id=tenant_uuid,
+        channel=channel,
+        customer_identifier=customer_id,
+        customer_name=customer_name or f"Customer ({customer_id[:6]})",
+        sentiment_score=1.0,
+        risk_score=0.0,
+        is_paused_for_human=False,
+    )
+    db.add(conversation)
+    await db.flush()
+    return conversation
+
+
 async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
     """
     Asynchronous background handler for Meta webhooks (comments, DMs, private replies).
@@ -114,34 +152,9 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
 
                     channel = "instagram" if (recipient_id == ig_account_id or customer_id == ig_account_id) else "facebook"
 
-                    # Get or create Conversation
-                    conv_stmt = (
-                        select(Conversation)
-                        .where(
-                            Conversation.tenant_id == tenant_uuid,
-                            Conversation.customer_identifier == customer_id,
-                            Conversation.channel == channel,
-                        )
-                        .order_by(Conversation.updated_at.desc())
-                        .limit(1)
+                    conv = await get_or_create_meta_conversation(
+                        db, tenant_uuid, customer_id, channel,
                     )
-                    conv_res = await db.execute(conv_stmt)
-                    conv = conv_res.scalars().first()
-
-                    if not conv:
-                        import uuid as uuid_pkg
-                        conv = Conversation(
-                            id=uuid_pkg.uuid4(),
-                            tenant_id=tenant_uuid,
-                            channel=channel,
-                            customer_identifier=customer_id,
-                            customer_name=f"Customer ({customer_id[:6]})",
-                            sentiment_score=1.0,
-                            risk_score=0.0,
-                            is_paused_for_human=False,
-                        )
-                        db.add(conv)
-                        await db.flush()
 
                     # Save incoming customer interaction log
                     cust_log = InteractionLog(
@@ -222,17 +235,55 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                 changes_events = entry.get("changes", [])
                 for change in changes_events:
                     val = change.get("value", {})
-                    if val.get("item") == "comment" and val.get("verb") in ("add", None):
-                        comment_id = val.get("comment_id")
-                        comment_msg = val.get("message")
-                        sender_id = val.get("from", {}).get("id")
-                        sender_name = val.get("from", {}).get("name")
+                    is_comment = (
+                        change.get("field") == "comments"
+                        or val.get("item") == "comment"
+                    )
+                    if is_comment and val.get("verb") in ("add", None):
+                        comment_id = val.get("comment_id") or val.get("id")
+                        comment_id = str(comment_id) if comment_id is not None else None
+                        comment_msg = val.get("message") or val.get("text")
+                        sender = val.get("from") or {}
+                        sender_id = sender.get("id")
+                        sender_id = str(sender_id) if sender_id is not None else None
+                        sender_name = sender.get("name") or sender.get("username")
 
                         # Don't reply to comments made by the Page itself
                         if not comment_id or not comment_msg or sender_id in (fb_page_id, ig_account_id):
                             continue
 
                         channel = "instagram" if entry.get("id") == ig_account_id else "facebook"
+
+                        # Comments can arrive without a DM event in the same webhook payload.
+                        conv = await get_or_create_meta_conversation(
+                            db, tenant_uuid, sender_id, channel, sender_name,
+                        )
+
+                        db.add(InteractionLog(
+                            tenant_id=tenant_uuid,
+                            conversation_id=conv.id,
+                            sender_type="customer",
+                            message_text=comment_msg,
+                            raw_payload=change,
+                        ))
+                        await db.commit()
+
+                        await HITLOrchestrator.broadcast_workbench_event(
+                            tenant_uuid,
+                            {
+                                "type": "new_message",
+                                "conversation_id": str(conv.id),
+                                "tenant_id": str(tenant_uuid),
+                                "sender_type": "customer",
+                                "message_text": comment_msg,
+                                "customer_identifier": sender_id,
+                                "channel": channel,
+                                "is_paused_for_human": conv.is_paused_for_human,
+                                "is_comment": True,
+                            },
+                        )
+                        if conv.is_paused_for_human:
+                            continue
 
                         agent = SocialSalesAgent(db=db)
                         initial_state = {
@@ -265,7 +316,17 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                             "dispatch_status": "pending",
                         }
 
-                        await agent.execute(initial_state)
+                        final_state = await agent.execute(initial_state)
+                        if final_state.get("reply_text"):
+                            agent_log = InteractionLog(
+                                tenant_id=tenant_uuid,
+                                conversation_id=conv.id,
+                                sender_type="agent",
+                                message_text=final_state["reply_text"],
+                                raw_payload=__import__("app.core.safety", fromlist=["redact"]).redact(final_state),
+                            )
+                            db.add(agent_log)
+                            await db.commit()
 
             # Completion belongs to the durable inbox worker, not Redis.
             logger.info(f"Successfully processed Meta event {event_id} for tenant {tenant_uuid}")

@@ -123,6 +123,8 @@ async def current_admin(request: Request):
         "authenticated": True,
         "role": "owner",
         "meta_app_id": settings.META_APP_ID,
+        "meta_login_config_id": settings.META_LOGIN_CONFIG_ID,
+        "whatsapp_embedded_signup_config_id": settings.WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID,
     }
 
 

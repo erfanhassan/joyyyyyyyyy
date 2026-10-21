@@ -93,6 +93,8 @@ def test_verified_owner_can_reach_protected_auth_endpoint(production_client, mon
         "authenticated": True,
         "role": "owner",
         "meta_app_id": "test-meta-app-id",
+        "meta_login_config_id": "",
+        "whatsapp_embedded_signup_config_id": "",
     }
 
 

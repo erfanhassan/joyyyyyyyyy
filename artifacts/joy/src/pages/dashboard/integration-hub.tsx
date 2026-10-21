@@ -33,6 +33,7 @@ import {
 import { apiUrl } from "@/lib/api";
 import { IntegrationDiagnostic } from "@/components/integration-diagnostic";
 import { useTenant } from "@/lib/tenant-context";
+import { loadMetaSdk } from "@/lib/meta-sdk";
 
 interface IntegrationRecord {
   id: string;
@@ -74,6 +75,8 @@ export default function IntegrationHubPage() {
   }>>([]);
   const [isDiscoveringPages, setIsDiscoveringPages] = useState(false);
   const [metaAppId, setMetaAppId] = useState("");
+  const [metaLoginConfigId, setMetaLoginConfigId] = useState("");
+  const [whatsappSignupConfigId, setWhatsappSignupConfigId] = useState("");
 
   // Shopify Form Inputs
   const [shopifyDomain, setShopifyDomain] = useState("");
@@ -139,8 +142,18 @@ export default function IntegrationHubPage() {
         if (!response.ok) return;
         const data = await response.json();
         setMetaAppId(typeof data.meta_app_id === "string" ? data.meta_app_id : "");
+        setMetaLoginConfigId(typeof data.meta_login_config_id === "string" ? data.meta_login_config_id : "");
+        setWhatsappSignupConfigId(
+          typeof data.whatsapp_embedded_signup_config_id === "string"
+            ? data.whatsapp_embedded_signup_config_id
+            : ""
+        );
       })
-      .catch(() => setMetaAppId(""));
+      .catch(() => {
+        setMetaAppId("");
+        setMetaLoginConfigId("");
+        setWhatsappSignupConfigId("");
+      });
   }, [tenantId]);
 
   const copyEmbedCode = () => {
@@ -152,94 +165,55 @@ export default function IntegrationHubPage() {
   // Helper to find integration by provider
   const getIntegration = (provider: string) => integrations.find((i) => i.provider === provider && i.is_active);
 
-  // Launch Meta Login Dialog Popup with CSRF state nonce and required scopes
-  const handleLaunchMetaLogin = () => {
-    if (!metaAppId) {
-      setActionStatus("Meta sign-in is unavailable because META_APP_ID is not configured.");
+  // Facebook Login for Business uses the Meta Dashboard configuration rather than a raw scope list.
+  const handleLaunchMetaLogin = async () => {
+    if (!metaAppId || !metaLoginConfigId) {
+      setActionStatus("Meta sign-in needs META_APP_ID and META_LOGIN_CONFIG_ID configured on the server.");
       return;
     }
-    const redirectUri = window.location.origin + "/dashboard/integration-hub";
-    const scopes = [
-      "pages_manage_metadata",
-      "pages_show_list",
-      "pages_read_engagement",
-      "pages_manage_posts",
-      "pages_messaging",
-      "instagram_basic",
-      "instagram_manage_messages",
-      "instagram_manage_comments",
-    ].join(",");
-
-    // Generate cryptographic CSRF state nonce
-    const oauthState = crypto.randomUUID();
-    sessionStorage.setItem("joy_meta_oauth_state", oauthState);
-    sessionStorage.setItem("joy_meta_oauth_started_at", String(Date.now()));
-
-    const oauthUrl = `https://www.facebook.com/v24.0/dialog/oauth?client_id=${encodeURIComponent(metaAppId)}&redirect_uri=${encodeURIComponent(
-      redirectUri
-    )}&scope=${encodeURIComponent(scopes)}&state=${encodeURIComponent(oauthState)}&response_type=token,granted_scopes`;
-
-    const popup = window.open(oauthUrl, "meta_oauth", "width=650,height=750");
-
-    const interval = setInterval(() => {
-      try {
-        if (!popup || popup.closed) {
-          clearInterval(interval);
+    setActionStatus(null);
+    setIsDiscoveringPages(true);
+    try {
+      const sdk = await loadMetaSdk(metaAppId);
+      sdk.login((response) => {
+        const accessToken = response.authResponse?.accessToken;
+        if (!accessToken) {
+          setIsDiscoveringPages(false);
+          setActionStatus("Meta login was cancelled or did not return a user access token.");
           return;
         }
-        if (popup.location.href.includes("access_token=")) {
-          const hash = popup.location.hash.substring(1);
-          const params = new URLSearchParams(hash);
-          const returnedState = params.get("state");
-          const expectedState = sessionStorage.getItem("joy_meta_oauth_state");
-
-          sessionStorage.removeItem("joy_meta_oauth_state");
-          const age = Date.now() - Number(sessionStorage.getItem("joy_meta_oauth_started_at") || 0);
-          sessionStorage.removeItem("joy_meta_oauth_started_at");
-          if (!returnedState || !expectedState || returnedState !== expectedState || age < 0 || age > 600000) {
-            popup.close();
-            clearInterval(interval);
-            alert("Security Error: OAuth state parameter mismatch. Authorization rejected.");
-            return;
-          }
-
-          const token = params.get("access_token");
-          if (token) {
-            popup.close();
-            clearInterval(interval);
-            handleExchangeUserToken(token);
-          }
-        }
-      } catch (e) {
-        // Cross-origin before redirect - expected until redirected back to Joy origin
-      }
-    }, 600);
+        void handleExchangeUserToken(accessToken);
+      }, { config_id: metaLoginConfigId });
+    } catch (error) {
+      setIsDiscoveringPages(false);
+      setActionStatus(error instanceof Error ? error.message : "Could not start Meta login.");
+    }
   };
 
-  // Exchange User Token for Discovered Pages
-  const handleExchangeUserToken = async (token: string) => {
+  const exchangeMetaCredential = async (credential: { code?: string; access_token?: string }) => {
     setIsDiscoveringPages(true);
     try {
       const res = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/meta/oauth-exchange`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token }),
+        body: JSON.stringify(credential),
       });
       const data = await res.json();
       if (res.ok && data.pages) {
         setMetaDiscoveredPages(data.pages);
         if (data.pages.length === 0) {
-          alert("No Facebook Pages found associated with this Meta account. Please verify that your account is an Admin of a Facebook Page.");
+          setActionStatus("No Facebook Pages were returned. Check the selected Meta assets and use a User access token configuration for Page discovery.");
         }
       } else {
-        alert(data.detail || "Failed to discover Facebook Pages.");
+        setActionStatus(data.detail || "Failed to discover Facebook Pages.");
       }
     } catch (err: any) {
-      alert("Error contacting Joy Meta OAuth server: " + err.message);
+      setActionStatus("Error contacting JOY Meta authorization: " + err.message);
     } finally {
       setIsDiscoveringPages(false);
     }
   };
+  const handleExchangeUserToken = (token: string) => exchangeMetaCredential({ access_token: token });
 
   // Select a discovered Facebook Page to connect & encrypt
   const handleSelectPage = async (page: any) => {
@@ -554,7 +528,10 @@ export default function IntegrationHubPage() {
 
       {/* Integration Channels Grid */}
       <WidgetOriginSettings />
-      <WhatsAppConnection />
+          <WhatsAppConnection
+            metaAppId={metaAppId}
+            signupConfigId={whatsappSignupConfigId}
+          />
       <OperationalStatus />
       <PrivacyRequests />
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -611,9 +588,9 @@ export default function IntegrationHubPage() {
               </div>
             )}
             <p className="text-[11px] leading-relaxed text-amber-800">
-              Page authorization does not enable automatic sales replies yet.
-              The Meta webhook-to-sales-agent dispatcher still needs implementation
-              and an end-to-end message test.
+              Supported inbound messages are routed to the Social Sales agent when the webhook fields,
+              permissions, and agent are enabled. Live delivery and replies still require an end-to-end
+              test with a real Meta Page.
             </p>
           </div>
 
@@ -968,9 +945,11 @@ export default function IntegrationHubPage() {
               <div>
                 <div className="flex items-center gap-2">
                   <h3 className="text-base font-bold text-foreground">Connect Meta Business Suite</h3>
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
-                    App: 2021434265932652
-                  </span>
+                  {metaAppId && (
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                      App: {metaAppId}
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-muted mt-0.5">
                   Link your Facebook Page and Instagram Professional Account. Credentials are encrypted with AES-256 before storing.
@@ -990,7 +969,7 @@ export default function IntegrationHubPage() {
                   metaTab === "oauth" ? "bg-white text-foreground shadow-sm" : "text-muted hover:text-foreground"
                 }`}
               >
-                1-Click Facebook Login
+                  Facebook Login for Business
               </button>
               <button
                 type="button"
@@ -1010,9 +989,9 @@ export default function IntegrationHubPage() {
                     <Share2 className="w-5 h-5" />
                   </div>
                   <div>
-                    <h4 className="text-xs font-bold text-foreground">Meta Social Authentication</h4>
+                    <h4 className="text-xs font-bold text-foreground">Meta Business Login</h4>
                     <p className="text-[11px] text-muted max-w-sm mx-auto mt-0.5">
-                      Log in to your Meta account to automatically discover your Facebook Pages and connected Instagram Business accounts.
+                      Authorize the Pages and connected Instagram accounts selected in JOY’s Meta Business Login user-token configuration.
                     </p>
                   </div>
 
@@ -1020,15 +999,16 @@ export default function IntegrationHubPage() {
                     <button
                       type="button"
                       onClick={handleLaunchMetaLogin}
-                      disabled={isDiscoveringPages || !metaAppId}
+                      disabled={isDiscoveringPages || !metaAppId || !metaLoginConfigId}
                       className="w-full py-2.5 px-4 bg-[#1877F2] hover:bg-[#166fe5] disabled:cursor-not-allowed disabled:opacity-50 text-white font-semibold rounded-lg text-xs transition-colors shadow-sm flex items-center justify-center gap-2"
                     >
                       <Share2 className="w-4 h-4" />
-                      <span>{isDiscoveringPages ? "Waiting for Meta Authorization..." : "Log In With Facebook (1-Click)"}</span>
+                      <span>{isDiscoveringPages ? "Waiting for Meta authorization..." : "Continue with Facebook"}</span>
                     </button>
-                    {!metaAppId && (
+                    {(!metaAppId || !metaLoginConfigId) && (
                       <p className="text-[11px] text-muted">
-                        Meta sign-in is unavailable until the server's Meta app ID is configured.
+                        Meta sign-in needs the server’s Meta app ID and Business Login configuration ID. Set
+                        META_APP_ID and META_LOGIN_CONFIG_ID after creating a User access token configuration in Meta.
                       </p>
                     )}
 
