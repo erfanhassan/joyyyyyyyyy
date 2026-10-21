@@ -7,11 +7,14 @@ branch_labels = depends_on = None
 
 
 def upgrade():
-    op.create_table("privacy_requests",
-        sa.Column("code", UUID(as_uuid=True), primary_key=True),
-        sa.Column("user_hash", sa.String(64), nullable=False),
-        sa.Column("status", sa.String(30), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()))
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if "privacy_requests" not in inspector.get_table_names():
+        op.create_table("privacy_requests",
+            sa.Column("code", UUID(as_uuid=True), primary_key=True),
+            sa.Column("user_hash", sa.String(64), nullable=False),
+            sa.Column("status", sa.String(30), nullable=False),
+            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()))
 
 
 def downgrade():
