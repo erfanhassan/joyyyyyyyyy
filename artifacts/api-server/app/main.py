@@ -5,9 +5,14 @@ from fastapi import HTTPException
 import httpx
 from starlette.responses import Response
 from app.core.config import settings
+import logging
+# Provider-mandated OAuth query fields must never appear in request-level logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 from app.core.clerk_auth import clerk_auth_configured
 from app.core.deployment_guard import DeploymentGuard, is_public_deployment
+from app.core.request_limits import RequestLimitsMiddleware
 from app.api.webhooks.meta import router as meta_webhook_router
+from app.api.webhooks.meta_privacy import router as meta_privacy_router
 from app.api.webhooks.shopify import router as shopify_webhook_router
 from app.api.webhooks.woocommerce import router as woocommerce_webhook_router
 from app.api.webhooks.custom import router as custom_webhook_router
@@ -16,6 +21,7 @@ from app.api.routes.knowledge import router as knowledge_router
 from app.api.routes.widget import router as widget_router
 from app.api.routes.tenant import router as tenant_router
 from app.api.routes.agent_config import router as agent_config_router
+from app.api.routes.operations import router as operations_router
 from app.api.websockets.workbench import router as workbench_router
 
 from contextlib import asynccontextmanager
@@ -31,7 +37,15 @@ logger = logging.getLogger("joy.main")
 async def lifespan(app: FastAPI):
     # Schema is managed separately: Alembic in development, Publish in production.
     # Never run schema-changing statements while the application starts.
+    import asyncio
+    from app.services.webhook_jobs import worker
+    task = asyncio.create_task(worker(), name="durable-webhook-worker")
     yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     await async_engine.dispose()
 
 
@@ -49,14 +63,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.BACKEND_CORS_ORIGINS,
     allow_origin_regex=".*",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLimitsMiddleware)
 app.add_middleware(DeploymentGuard)
 
 # Register Ingestion Webhook Routers
 app.include_router(meta_webhook_router, prefix="/api/v1/webhooks")
+app.include_router(meta_privacy_router, prefix="/api/v1/webhooks")
 app.include_router(shopify_webhook_router, prefix="/api/v1/webhooks")
 app.include_router(woocommerce_webhook_router, prefix="/api/v1/webhooks")
 app.include_router(custom_webhook_router, prefix="/api/v1/webhooks")
@@ -80,6 +96,7 @@ app.include_router(tenant_router, prefix="/api/v1")
 app.include_router(tenant_router, prefix="/api")
 app.include_router(agent_config_router, prefix="/api/v1")
 app.include_router(agent_config_router, prefix="/api")
+app.include_router(operations_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["System"])
@@ -100,9 +117,7 @@ async def health_check():
 
 @app.get("/api/auth/me", tags=["Authentication"], include_in_schema=False)
 async def current_admin(request: Request):
-    if is_public_deployment() and not request.scope.get("state", {}).get(
-        "is_joy_owner"
-    ):
+    if is_public_deployment() and not request.scope.get("state", {}).get("clerk_user_id"):
         raise HTTPException(status_code=401, detail="Sign in to continue.")
     return {
         "authenticated": True,
@@ -128,6 +143,9 @@ async def clerk_frontend_api_proxy(request: Request, path: str = ""):
         raise HTTPException(status_code=503, detail="Sign-in proxy is not configured.")
 
     headers = dict(request.headers)
+    # Avoid intermediary encoding transformations on security-critical scripts.
+    # Raw-byte forwarding below still preserves any encoding an upstream sends.
+    headers["accept-encoding"] = "identity"
     for hop_header in (
         "host",
         "connection",

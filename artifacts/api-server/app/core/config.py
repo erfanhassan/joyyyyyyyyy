@@ -9,7 +9,12 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "JOY"
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = "development"
-    DEBUG: bool = True
+    DEBUG: bool = False
+    ALLOW_PUBLIC_SIGNUPS: bool = False
+    MAX_UPLOAD_BYTES: int = 25 * 1024 * 1024
+    MAX_CRAWL_BYTES: int = 2 * 1024 * 1024
+    MAX_DOCUMENT_CHUNKS: int = 500
+    SHOPIFY_API_VERSION: str = "2026-07"
     
     # CORS Origins
     BACKEND_CORS_ORIGINS: List[str] = [

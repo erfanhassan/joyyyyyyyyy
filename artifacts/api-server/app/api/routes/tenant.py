@@ -74,32 +74,8 @@ async def get_my_workspace(
     Dynamically resolves or provisions the workspace for the authenticated merchant/operator.
     Falls back to the default storefront in local/offline development.
     """
-    user_id = request.scope.get("state", {}).get("clerk_user_id")
-
-    tenant = None
-    if user_id:
-        stmt = (
-            select(Tenant)
-            .join(User, User.tenant_id == Tenant.id)
-            .where(User.email == user_id)
-        )
-        res = await db.execute(stmt)
-        tenant = res.scalar_one_or_none()
-
-    if not tenant:
-        res = await db.execute(select(Tenant).order_by(Tenant.created_at.asc()).limit(1))
-        tenant = res.scalar_one_or_none()
-
-    if not tenant:
-        tenant = Tenant(
-            name="My Storefront",
-            currency="BDT",
-            timezone="Asia/Dhaka",
-            domain=settings.DOMAIN or "joy.sonictch.com",
-        )
-        db.add(tenant)
-        await db.commit()
-        await db.refresh(tenant)
+    from app.services.workspaces import workspace_for
+    tenant, role = await workspace_for(request, db)
 
     int_stmt = select(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant.id,
@@ -118,7 +94,7 @@ async def get_my_workspace(
         "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
         "active_integrations_count": len(active_integrations),
         "configured_providers": [i.provider for i in active_integrations],
-        "role": "owner",
+        "role": role,
     }
 
 
@@ -131,7 +107,20 @@ async def onboard_merchant_workspace(
     """
     Provisions a brand new isolated business workspace for an onboarding merchant.
     """
-    user_id = request.scope.get("state", {}).get("clerk_user_id") or "owner@joy.sonictch.com"
+    from app.services.workspaces import actor, bind
+    from app.db.models import WorkspaceIdentity
+    from sqlalchemy import text
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    user_id, email, _ = actor(request)
+    try:
+        ZoneInfo(payload.timezone or "Asia/Dhaka")
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(400, "Choose a valid IANA timezone.") from None
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:subject))"), {"subject": user_id})
+    existing = (await db.execute(select(WorkspaceIdentity).where(
+        WorkspaceIdentity.clerk_user_id == user_id))).scalar_one_or_none()
+    if existing:
+        return {"status": "already_created", "id": str(existing.tenant_id)}
 
     new_tenant = Tenant(
         name=payload.name.strip(),
@@ -142,15 +131,7 @@ async def onboard_merchant_workspace(
     db.add(new_tenant)
     await db.flush()
 
-    # Assign owner user
-    new_user = User(
-        tenant_id=new_tenant.id,
-        email=user_id,
-        full_name=payload.name.strip(),
-        role="owner",
-    )
-    db.add(new_user)
-    await db.commit()
+    await bind(db, user_id, email, new_tenant)
     await db.refresh(new_tenant)
 
     return {
@@ -195,6 +176,30 @@ async def get_tenant_profile(tenant_id: UUID, db: AsyncSession = Depends(get_db)
         "active_integrations_count": len(active_integrations),
         "configured_providers": [i.provider for i in active_integrations],
     }
+
+
+class WidgetOriginUpdate(BaseModel):
+    domain: str = Field(min_length=1, max_length=255)
+
+
+@router.patch("/{tenant_id}/widget-origin")
+async def update_widget_origin(tenant_id: UUID, payload: WidgetOriginUpdate, db: AsyncSession = Depends(get_db)):
+    from urllib.parse import urlsplit
+    try:
+        parsed=urlsplit(payload.domain.strip())
+        if (parsed.scheme!="https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.port not in (None,443) or parsed.query or parsed.fragment or parsed.path not in ("","/")):
+            raise ValueError()
+        host=parsed.hostname.encode("idna").decode().lower()
+        origin=f"https://{'['+host+']' if ':' in host else host}"
+    except (ValueError,UnicodeError):
+        raise HTTPException(400,"Use an exact HTTPS website origin without credentials, a path, or a custom port.") from None
+    tenant=(await db.execute(select(Tenant).where(Tenant.id==tenant_id))).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(404,"Workspace not found.")
+    tenant.domain=origin
+    await db.commit()
+    return {"status":"success","domain":origin}
 
 
 @router.put("/{tenant_id}")
@@ -268,7 +273,7 @@ async def list_tenant_integrations(tenant_id: UUID, db: AsyncSession = Depends(g
             "provider": item.provider,
             "is_active": item.is_active,
             "masked_token": masked_token,
-            "settings": item.settings or {},
+            "settings": __import__("app.core.safety", fromlist=["redact"]).redact(item.settings or {}),
             "created_at": item.created_at.isoformat() if item.created_at else None,
         })
 
@@ -299,6 +304,13 @@ async def save_tenant_integration(
             db,
         )
 
+    if payload.provider == "whatsapp":
+        from app.services.whatsapp import WhatsAppService
+        try:
+            payload.settings = await WhatsAppService.verify_connection(payload.access_token, payload.settings)
+        except (ValueError, RuntimeError):
+            raise HTTPException(400, "WhatsApp verification failed. Check phone/WABA ownership, permissions and token validity.") from None
+
     # Verify tenant exists
     tenant_stmt = select(Tenant).where(Tenant.id == tenant_id)
     t_res = await db.execute(tenant_stmt)
@@ -306,10 +318,23 @@ async def save_tenant_integration(
         raise HTTPException(status_code=404, detail="Tenant does not exist.")
 
     # Encrypt the token using Fernet AES-256
+    if payload.provider not in ("shopify","woocommerce","whatsapp"):
+        raise HTTPException(409,"This provider is not implemented. No connection was saved.")
     encrypted_token = encrypt_token(payload.access_token)
     encrypted_refresh = encrypt_token(payload.refresh_token) if payload.refresh_token else None
+    from app.core.safety import seal_credentials
+    safe_settings = seal_credentials(payload.settings)
 
     # Check if integration already exists for this provider
+    if payload.provider in ("shopify","woocommerce"):
+        from app.services.commerce import CommerceService
+        candidate = TenantIntegration(tenant_id=tenant_id,provider=payload.provider,
+            access_token_encrypted=encrypted_token,settings=safe_settings,is_active=True)
+        try:
+            safe_settings.update(await CommerceService.verify_read(candidate))
+        except Exception:
+            raise HTTPException(400,"Store verification failed. Check the canonical store URL, API credentials and required read permissions. No connection was saved.") from None
+
     stmt = select(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant_id,
         TenantIntegration.provider == payload.provider,
@@ -320,7 +345,7 @@ async def save_tenant_integration(
     if existing:
         existing.access_token_encrypted = encrypted_token
         existing.refresh_token_encrypted = encrypted_refresh
-        existing.settings = payload.settings
+        existing.settings = safe_settings
         existing.is_active = True
         integration_obj = existing
         action = "updated"
@@ -330,7 +355,7 @@ async def save_tenant_integration(
             provider=payload.provider,
             access_token_encrypted=encrypted_token,
             refresh_token_encrypted=encrypted_refresh,
-            settings=payload.settings,
+            settings=safe_settings,
             is_active=True,
         )
         db.add(integration_obj)
@@ -410,6 +435,14 @@ async def meta_select_page(
     page_identity = await MetaAPIClient.get_page_identity(
         payload.page_id, payload.page_access_token,
     )
+    instagram = page_identity.get("instagram_business_account") or {}
+    if payload.instagram_account_id and str(instagram.get("id", "")) != payload.instagram_account_id:
+        raise HTTPException(400, "The selected Instagram account is not linked to this verified Page.")
+    from app.services.meta_identity import token_owner
+    try:
+        meta_user_id = await token_owner(payload.page_access_token)
+    except Exception:
+        raise HTTPException(400, "Meta could not verify this token's app and authorizing user. Reconnect with the configured application.") from None
     encrypted_token = encrypt_token(payload.page_access_token)
     # Do not persist a successful connection unless Meta confirms subscription.
     webhook_sub_res = await MetaAPIClient.subscribe_page_to_webhooks(
@@ -432,8 +465,8 @@ async def meta_select_page(
     settings_data = {
         "page_name": page_identity["name"],
         "page_id": payload.page_id,
-        "instagram_account_id": payload.instagram_account_id or "",
-        "instagram_username": payload.instagram_username or "",
+        "instagram_account_id": str(instagram.get("id") or ""),
+        "instagram_username": instagram.get("username") or "",
         "requested_permissions": [
             "pages_manage_metadata",
             "pages_show_list",
@@ -445,6 +478,7 @@ async def meta_select_page(
             "instagram_manage_comments",
         ],
     }
+    settings_data["meta_user_id"] = meta_user_id
 
     if existing:
         existing.access_token_encrypted = encrypted_token
@@ -508,9 +542,34 @@ async def disconnect_tenant_integration(
             page_token = decrypt_token(existing_item.access_token_encrypted)
             page_id = (existing_item.settings or {}).get("page_id")
             if page_id and page_token:
-                await MetaAPIClient.unsubscribe_page_from_webhooks(page_id, page_token)
-        except Exception as e:
-            logger.warning(f"Error during Meta webhook unsubscription on disconnect: {e}")
+                result = await MetaAPIClient.unsubscribe_page_from_webhooks(page_id, page_token)
+                if not result.get("success"):
+                    raise RuntimeError("Unsubscription was not confirmed.")
+        except Exception:
+            raise HTTPException(502, "Meta unsubscription failed. The encrypted connection was retained so you can retry.") from None
+
+    if provider == "whatsapp":
+        try:
+            from app.services.whatsapp import WhatsAppService
+            token = decrypt_token(existing_item.access_token_encrypted)
+            business = (existing_item.settings or {}).get("waba_id", "")
+            response = await WhatsAppService.api(token, "DELETE", f"{business}/subscribed_apps")
+            if not response.get("success"):
+                raise RuntimeError("Unsubscription was not confirmed.")
+        except Exception:
+            raise HTTPException(502, "WhatsApp unsubscription failed. The encrypted connection was retained for retry.") from None
+
+    if provider in ("meta", "whatsapp"):
+        # Retain the verified subject association for subsequent Meta deletion
+        # requests, but destroy all reusable credentials after unsubscribe.
+        from app.core.safety import redact
+        existing_item.is_active = False
+        existing_item.access_token_encrypted = ""
+        existing_item.refresh_token_encrypted = None
+        existing_item.settings = redact(existing_item.settings or {})
+        await db.commit()
+        return {"status":"success", "provider":provider,
+                "message":"Webhook unsubscription confirmed and credentials removed. Privacy association retained until data deletion."}
 
     stmt = delete(TenantIntegration).where(
         TenantIntegration.tenant_id == tenant_id,
@@ -523,7 +582,7 @@ async def disconnect_tenant_integration(
     return {
         "status": "success",
         "provider": provider,
-        "message": f"{provider.capitalize()} integration successfully disconnected and webhooks unsubscribed.",
+        "message": f"{provider.capitalize()} integration disconnected." + (" Webhook unsubscription confirmed." if provider in ("meta", "whatsapp") else " Remove any manually configured store webhooks in the provider dashboard."),
     }
 
 

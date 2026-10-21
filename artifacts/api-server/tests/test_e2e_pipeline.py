@@ -37,7 +37,7 @@ TestSessionLocal = async_sessionmaker(bind=test_engine, class_=AsyncSession, exp
 
 
 @pytest.mark.asyncio
-async def test_webhook_hmac_and_idempotency():
+async def test_webhook_hmac_and_idempotency(monkeypatch):
     """
     Constraint 1: Webhook Security & Idempotency
     - Invalid HMAC signatures return HTTP 401 Unauthorized.
@@ -45,6 +45,21 @@ async def test_webhook_hmac_and_idempotency():
     - Redis SETNX deduplication drops duplicate event IDs within 24 hours.
     """
     transport = ASGITransport(app=app)
+    from app.services import store_webhooks
+    from app.db.models import TenantIntegration
+    secret = "joy_shopify_api_secret_test_key"
+    monkeypatch.setattr(settings, "SHOPIFY_API_SECRET", secret)
+    async def mapped(request, provider, tenant_id, body, signature):
+        from app.core.hmac_middleware import verify_shopify_signature
+        from fastapi import HTTPException
+        if not verify_shopify_signature(body, signature, secret):
+            raise HTTPException(401, "Invalid signature")
+        return fixture_tenant
+    fixture_tenant = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        db.add(Tenant(id=fixture_tenant, name="Offline webhook fixture"))
+        await db.commit()
+    monkeypatch.setattr(store_webhooks, "authenticate_store", mapped)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         tenant_id = str(uuid.uuid4())
         event_id = f"evt_{uuid.uuid4().hex[:10]}"
@@ -98,6 +113,10 @@ async def test_webhook_hmac_and_idempotency():
         )
         assert dup_res.status_code == 200
         assert dup_res.json()["status"] == "duplicate_ignored"
+    from sqlalchemy import delete
+    async with TestSessionLocal() as db:
+        await db.execute(delete(Tenant).where(Tenant.id == fixture_tenant))
+        await db.commit()
 
 
 @pytest.mark.asyncio
@@ -223,7 +242,8 @@ async def test_discount_cap_guardrails():
         # Must be capped at 10%
         assert discount_res["approved_pct"] == 10
         assert discount_res["is_capped"] is True
-        assert discount_res["discount_code"].startswith("JOY10_")
+        assert discount_res["discount_code"] is None
+        assert discount_res["checkout_url"] is None
 
         # Test LangGraph Agent state machine execution
         agent = SocialSalesAgent(db=db)

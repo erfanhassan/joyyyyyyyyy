@@ -341,6 +341,14 @@ class HITLOrchestrator:
                 dispatch_status = "failed_provider"
                 dispatch_error = str(e)
                 logger.error(f"External channel dispatch error: {e}")
+        elif conv.channel == "whatsapp":
+            try:
+                from app.services.whatsapp import WhatsAppService
+                provider_response = await WhatsAppService.send(db, conv, message_text)
+                dispatch_status = "dispatched_whatsapp"
+            except Exception as error:
+                dispatch_status = "failed_provider"
+                dispatch_error = str(error)
         elif conv.channel == "web_widget":
             dispatch_status = "dispatched_web_widget"
 

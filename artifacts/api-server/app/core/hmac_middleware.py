@@ -17,8 +17,7 @@ def verify_meta_signature(
     Format: 'sha256=<hex_digest>'
     """
     if not secret:
-        # If no secret configured in test/dev, allow
-        return True
+        return False
     if not signature_header:
         logger.warning("Missing Meta X-Hub-Signature-256 header")
         return False
@@ -48,7 +47,7 @@ def verify_shopify_signature(
     Format: '<base64_encoded_digest>'
     """
     if not secret:
-        return True
+        return False
     if not signature_header:
         logger.warning("Missing Shopify X-Shopify-Hmac-Sha256 header")
         return False
@@ -73,7 +72,7 @@ def verify_woocommerce_signature(
     Format: '<base64_encoded_digest>'
     """
     if not secret:
-        return True
+        return False
     if not signature_header:
         logger.warning("Missing WooCommerce X-WC-Webhook-Signature header")
         return False
@@ -98,7 +97,7 @@ def verify_custom_signature(
     Accepts either hex or 'sha256=<hex>'.
     """
     if not secret:
-        return True
+        return False
     if not signature_header:
         logger.warning("Missing custom X-Signature-SHA256 header")
         return False

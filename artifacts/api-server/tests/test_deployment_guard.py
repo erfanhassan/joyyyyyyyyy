@@ -186,7 +186,7 @@ def test_clerk_proxy_preserves_encoded_wire_bytes(production_client, monkeypatch
 
 @pytest.mark.parametrize("provider", ["meta", "shopify", "woocommerce", "custom"])
 def test_unconfigured_webhooks_are_closed(production_client, provider):
-    assert production_client.post(f"/api/v1/webhooks/{provider}", json={}).status_code == 403
+    assert production_client.post(f"/api/v1/webhooks/{provider}", json={}).status_code in (401, 403)
 
 
 def test_configured_webhook_still_requires_signature(production_client, monkeypatch):

@@ -1,4 +1,5 @@
 import uuid
+from sqlalchemy import Index
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Index,
     Computed,
     LargeBinary,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB, TSVECTOR
 from sqlalchemy.orm import declarative_base, relationship
@@ -53,6 +55,7 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    clerk_user_id = Column(String(255), unique=True, nullable=True, index=True)
     full_name = Column(String(255), nullable=True)
     role = Column(String(50), default="operator")  # 'owner', 'admin', 'operator'
     created_at = Column(DateTime(timezone=True), default=get_utc_now)
@@ -152,6 +155,7 @@ class InteractionLog(Base):
 # ==========================================
 class Order(Base):
     __tablename__ = "orders"
+    __table_args__ = (Index("uq_orders_store_external", "tenant_id", "storefront_provider", "external_order_id", unique=True),)
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -282,3 +286,60 @@ class CheckpointWriteModel(Base):
     type = Column(String(50), nullable=False)
     blob = Column(LargeBinary, nullable=True)
     task_path = Column(String(255), nullable=False, default="")
+
+
+class WebhookJob(Base):
+    __tablename__ = "webhook_jobs"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider = Column(String(30), nullable=False)
+    event_id = Column(String(255), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    payload = Column(JSONB, nullable=False)
+    topic = Column(String(100), nullable=True)
+    status = Column(String(30), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(DateTime(timezone=True), default=get_utc_now, nullable=False)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=get_utc_now)
+    __table_args__ = (UniqueConstraint("provider", "tenant_id", "event_id"),)
+
+
+class PublicRateCounter(Base):
+    __tablename__ = "public_rate_counters"
+    key = Column(String(255), primary_key=True)
+    count = Column(Integer, nullable=False, default=0)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class WorkspaceIdentity(Base):
+    """Authorization lookup contains no provider credentials or conversation data."""
+    __tablename__ = "workspace_identities"
+    clerk_user_id = Column(String(255), primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(30), nullable=False)
+
+
+class CheckoutRequest(Base):
+    __tablename__ = "checkout_requests"
+    key = Column(String(64), primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(30), nullable=False, default="creating")
+    result = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=get_utc_now)
+
+
+class DeliveryReceipt(Base):
+    __tablename__ = "delivery_receipts"
+    key = Column(String(64), primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(30), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=get_utc_now)
+
+
+class PrivacyRequest(Base):
+    __tablename__ = "privacy_requests"
+    code = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_hash = Column(String(64), nullable=False)
+    status = Column(String(30), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=get_utc_now)

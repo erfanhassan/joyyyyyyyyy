@@ -9,7 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timezone
 from app.core.config import settings
-from app.db.models import AgentConfig, Conversation, InteractionLog
+from app.db.models import AgentConfig, Conversation, InteractionLog, TenantIntegration
+from app.services.commerce import CommerceService, CommerceUnavailable
+from app.core.security import decrypt_token
+from app.core.safety import redact
 from app.services.mcp_catalog import MCPCatalogService
 from app.services.meta_api import MetaAPIClient
 from app.services.sentiment_service import SentimentService
@@ -26,7 +29,9 @@ class SocialSalesState(TypedDict):
     message_text: str
     comment_id: Optional[str]
     is_private_reply: bool
-    page_access_token: Optional[str]
+    integration_id: Optional[str]
+    request_id: Optional[str]
+    conversation_id: Optional[str]
     store_domain: Optional[str]
 
     # Agent configuration
@@ -130,8 +135,8 @@ class SocialSalesAgent:
         tenant_uuid = UUID(state["tenant_id"])
 
         # 1. Fetch AgentConfig for employee status, custom prompt, tone, and discount cap
-        max_discount_pct = 10
-        is_active = True
+        max_discount_pct = 0
+        is_active = False
         custom_prompt = None
         tone_settings = None
 
@@ -145,6 +150,8 @@ class SocialSalesAgent:
             if cfg:
                 max_discount_pct = cfg.max_discount_pct
                 is_active = cfg.is_active
+                from app.services.operating_hours import within_hours
+                is_active = is_active and within_hours(cfg.operational_hours)
                 custom_prompt = cfg.system_prompt
                 tone_settings = cfg.tone_settings
         except Exception as e:
@@ -183,6 +190,7 @@ class SocialSalesAgent:
                 is_already_paused = True
         except Exception as e:
             logger.warning(f"Error querying conversation pause status: {e}")
+            raise RuntimeError("Cannot verify human takeover state; refusing to send.") from None
 
         # Extract discount request percentage if mentioned
         discount_match = re.search(r"(\d{1,2})\s*%\s*(?:off|discount)?", raw_msg.lower())
@@ -238,7 +246,7 @@ class SocialSalesAgent:
                 tenant_uuid,
                 {
                     "type": "hitl_alert",
-                    "conversation_id": state.get("customer_id", "unknown"),
+                    "conversation_id": state.get("conversation_id", ""),
                     "tenant_id": state["tenant_id"],
                     "customer_name": state.get("customer_name") or "Customer",
                     "customer_identifier": state.get("customer_id", "unknown"),
@@ -266,20 +274,25 @@ class SocialSalesAgent:
         Node 2: Queries Knowledge Brain via MCP catalog.lookup and stock.check.
         """
         tenant_uuid = UUID(state["tenant_id"])
-        catalog_results = await MCPCatalogService.catalog_lookup(
-            db=self.db,
-            tenant_id=tenant_uuid,
-            query=state["message_text"],
-            top_k=2,
-        )
-
-        stock_info = None
-        if catalog_results:
-            stock_info = await MCPCatalogService.stock_check(
+        try:
+            catalog_results = await MCPCatalogService.catalog_lookup(
                 db=self.db,
                 tenant_id=tenant_uuid,
-                sku_or_title=state["message_text"],
+                query=state["message_text"],
+                top_k=2,
             )
+        except Exception as error:
+            logger.warning("Knowledge lookup unavailable: %s", type(error).__name__)
+            catalog_results = []
+        lookup = state["message_text"]
+        previous = state.get("stock_info") or {}
+        if previous.get("status") == "verified" and re.fullmatch(
+            r"(?:yes[, ]*)?(?:buy(?: it)?|checkout|purchase(?: it)?|order(?: it)?|place (?:the )?order)(?: please)?[.!]?",
+            lookup.strip().lower(),
+        ):
+            lookup = previous.get("sku") or previous.get("item") or lookup
+        stock_info = await MCPCatalogService.stock_check(
+            db=self.db, tenant_id=tenant_uuid, sku_or_title=lookup)
 
         return {
             "catalog_results": catalog_results,
@@ -294,12 +307,18 @@ class SocialSalesAgent:
         max_allowed = state.get("max_discount_pct", 10)
         tenant_uuid = UUID(state["tenant_id"])
 
-        discount_res = MCPCatalogService.discount_generate(
-            tenant_id=tenant_uuid,
-            requested_discount_pct=requested,
-            max_discount_pct=max_allowed,
-            store_domain=state.get("store_domain"),
-        )
+        approved = min(max(0, requested), max(0, max_allowed), 100)
+        discount_res = {"approved_pct": 0, "discount_code": None, "checkout_url": None}
+        # Do not create merchant orders in response to a greeting or ordinary FAQ.
+        wants_checkout = requested > 0 or bool(re.search(
+            r"\b(buy|checkout|purchase|place an order)\b", state["message_text"], re.I))
+        if wants_checkout and (state.get("stock_info") or {}).get("in_stock"):
+            try:
+                discount_res = await CommerceService.checkout(
+                    self.db, tenant_uuid, state["stock_info"], approved,
+                    state.get("request_id") or state.get("conversation_id") or state["customer_id"])
+            except CommerceUnavailable:
+                logger.warning("Store checkout is unavailable; no offer will be promised.")
 
         return {
             "approved_discount_pct": discount_res["approved_pct"],
@@ -317,68 +336,18 @@ class SocialSalesAgent:
         code = state.get("discount_code")
         checkout_url = state.get("checkout_url")
         raw_msg = state["message_text"]
-
-        catalog_text = "\n".join([f"- {c['content']}" for c in catalog]) if catalog else "General Store Catalog"
-
-        # Apply merchant custom system prompt & tone if configured
-        system_prompt = state.get("system_prompt") or SYSTEM_SALES_PROMPT
-        tone = state.get("tone_settings") or {}
-        formality = tone.get("formality", 0.5)
-        enthusiasm = tone.get("enthusiasm", 0.8)
-        tone_instruction = f"Tone guidance: formality level {formality:.1f} (0=casual, 1=formal), enthusiasm level {enthusiasm:.1f} (0=neutral, 1=excited)."
-
-        # If DeepSeek is available, generate conversational message
-        if settings.DEEPSEEK_API_KEY:
-            try:
-                prompt_content = f"""Customer asked: "{raw_msg}"
-Catalog Match:
-{catalog_text}
-
-Stock Info: {stock}
-Approved Discount: {code} ({state.get('approved_discount_pct')}% off)
-Checkout Link: {checkout_url}
-
-{tone_instruction}
-Compose a friendly, high-conversion sales reply. Mention item availability, the discount code if approved, and the checkout link."""
-
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(
-                        f"{settings.DEEPSEEK_BASE_URL}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": "deepseek-chat",
-                            "messages": [
-                                {"role": "system", "content": f"{system_prompt}\n{tone_instruction}"},
-                                {"role": "user", "content": prompt_content},
-                            ],
-                            "max_tokens": 200,
-                        },
-                    )
-                    if resp.status_code == 200:
-                        parsed = resp.json()
-                        reply = parsed["choices"][0]["message"]["content"].strip()
-                        return {"reply_text": reply}
-            except Exception as e:
-                logger.warning(f"DeepSeek response generation failed: {e}. Using deterministic response template.")
-
-        # Deterministic High-Conversion Response Template
-        items_desc = catalog[0]["content"].splitlines()[0] if catalog else "our featured collection"
-        if code:
-            reply = (
-                f"Great news! We have {items_desc} in stock! 🎉\n\n"
-                f"As a special treat, I've unlocked a {state.get('approved_discount_pct')}% discount for you with code **{code}**.\n\n"
-                f"👉 Complete your order here: {checkout_url}"
-            )
-        else:
-            reply = (
-                f"Hello! Yes, {items_desc} is available in stock! ✨\n\n"
-                f"You can view product details and place your order directly here: {checkout_url}"
-            )
-
-        return {"reply_text": reply}
+        # Stock, prices and offers are rendered deterministically. Neither a
+        # provider outage nor a language model may invent transactional facts.
+        if not stock or stock.get("status") != "verified":
+            return {"reply_text": "I can help with product information, but I cannot verify availability yet. Please provide the exact SKU or ask a store specialist."}
+        if not stock.get("in_stock"):
+            return {"reply_text": f"{stock.get('item', 'This item')} is currently unavailable. A store specialist can help with alternatives."}
+        if checkout_url:
+            offer = f" The store applied an approved {state.get('approved_discount_pct', 0)}% offer." if state.get("approved_discount_pct") else ""
+            if code:
+                offer = f" Enter code {code} at checkout for the store-approved {state.get('approved_discount_pct', 0)}% offer."
+            return {"reply_text": f"{stock.get('item', 'This item')} is available.{offer} Review the order, contact details, shipping and final total on the store's secure checkout: {checkout_url}"}
+        return {"reply_text": f"{stock.get('item', 'This item')} is listed as available by the store. Please confirm the exact product and quantity before checkout. If checkout is unavailable, a store specialist can assist."}
 
     async def _dispatch_channel_reply_node(self, state: SocialSalesState) -> Dict[str, Any]:
         """
@@ -388,11 +357,56 @@ Compose a friendly, high-conversion sales reply. Mention item availability, the 
         channel = state["channel"]
         reply_text = state["reply_text"]
         comment_id = state.get("comment_id")
-        page_token = state.get("page_access_token")
+        receipt = None
+        if channel in ("facebook", "instagram", "whatsapp"):
+            import hashlib
+            from sqlalchemy.dialects.postgresql import insert
+            from app.db.models import DeliveryReceipt
+            from app.services.webhook_jobs import ManualReviewRequired
+            event = state.get("request_id")
+            if not event:
+                raise RuntimeError("A stable incoming event ID is required before sending.")
+            key = hashlib.sha256(f"{state['tenant_id']}:{channel}:{event}".encode()).hexdigest()
+            reserved = (await self.db.execute(insert(DeliveryReceipt).values(
+                key=key, tenant_id=UUID(state["tenant_id"]), status="sending")
+                .on_conflict_do_nothing(index_elements=["key"]).returning(DeliveryReceipt.key))).scalar_one_or_none()
+            await self.db.commit()
+            receipt = (await self.db.execute(select(DeliveryReceipt).where(DeliveryReceipt.key == key))).scalar_one()
+            if not reserved:
+                if receipt.status == "sent":
+                    return {"dispatch_status": "already_delivered", "reply_text": ""}
+                raise ManualReviewRequired("Delivery outcome must be reviewed before another send.")
+        # Read fresh authority immediately before dispatch; never checkpoint tokens.
+        from app.services.operating_hours import within_hours
+        cfg = (await self.db.execute(select(AgentConfig).where(
+            AgentConfig.tenant_id == UUID(state["tenant_id"]),
+            AgentConfig.agent_type == "social_sales"))).scalars().first()
+        conv = (await self.db.execute(select(Conversation).where(
+            Conversation.tenant_id == UUID(state["tenant_id"]),
+            Conversation.customer_identifier == state["customer_id"],
+            Conversation.channel == channel).with_for_update())).scalars().first()
+        if not cfg or not cfg.is_active or not within_hours(cfg.operational_hours) or not conv or conv.is_paused_for_human:
+            if receipt:
+                receipt.status = "cancelled"
+                await self.db.commit()
+            return {"dispatch_status": "paused_before_dispatch", "reply_text": "", "is_paused_for_human": True}
+        page_token = None
+        if channel in ("facebook", "instagram"):
+            integration = (await self.db.execute(select(TenantIntegration).where(
+                TenantIntegration.id == UUID(state["integration_id"]),
+                TenantIntegration.tenant_id == UUID(state["tenant_id"]),
+                TenantIntegration.provider == "meta",
+                TenantIntegration.is_active.is_(True)))).scalar_one_or_none()
+            if not integration:
+                raise RuntimeError("The channel integration is disconnected.")
+            page_token = decrypt_token(integration.access_token_encrypted)
 
         dispatch_res = {}
         try:
-            if channel == "instagram":
+            if channel == "whatsapp":
+                from app.services.whatsapp import WhatsAppService
+                dispatch_res = await WhatsAppService.send(self.db, conv, reply_text, state.get("integration_id"))
+            elif channel == "instagram":
                 if state.get("is_private_reply") and comment_id:
                     dispatch_res = await MetaAPIClient.send_comment_to_dm_handshake(
                         comment_id=comment_id,
@@ -421,8 +435,16 @@ Compose a friendly, high-conversion sales reply. Mention item availability, the 
                         page_access_token=page_token,
                     )
         except Exception as e:
-            logger.error(f"Failed to dispatch channel reply: {e}")
-            return {"dispatch_status": f"failed: {str(e)}"}
+            logger.error("Channel delivery failed (%s)", type(e).__name__)
+            if receipt:
+                receipt.status = "needs_review"
+                await self.db.commit()
+            from app.services.webhook_jobs import ManualReviewRequired
+            raise ManualReviewRequired("Delivery could not be confirmed. Review the provider before resending.") from None
+
+        if receipt:
+            receipt.status = "sent"
+            await self.db.commit()
 
         return {"dispatch_status": "dispatched_successfully", "meta_response": dispatch_res}
 
@@ -431,11 +453,13 @@ Compose a friendly, high-conversion sales reply. Mention item availability, the 
         Run the LangGraph social sales state machine with PostgreSQL checkpoint persistence.
         Guarantees scoped thread ID across business, channel, and customer identifier.
         """
-        tid = thread_id or f"{initial_state['tenant_id']}:{initial_state.get('channel', 'social')}:{initial_state['customer_id']}"
+        # Never allow a caller-supplied session label to select another visitor's memory.
+        tid = f"{initial_state['tenant_id']}:{initial_state.get('channel', 'social')}:{initial_state['customer_id']}"
         config = {
             "configurable": {
                 "thread_id": str(tid),
-                "checkpoint_ns": "social_sales",
+                "checkpoint_ns": "social_sales_secure",
             }
         }
-        return await self.graph.ainvoke(initial_state, config=config)
+        clean_state = {k: v for k, v in initial_state.items() if k != "page_access_token"}
+        return await self.graph.ainvoke(clean_state, config=config)

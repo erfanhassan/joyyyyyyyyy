@@ -66,7 +66,7 @@ def test_authentication_accepts_only_the_configured_verified_owner(monkeypatch):
     monkeypatch.setattr(clerk_auth, "_verified_primary_email", owner_email)
 
     identity = asyncio.run(clerk_auth.authenticate_owner(_scope()))
-    assert identity == {"user_id": "user_test"}
+    assert identity == {"user_id": "user_test", "email": "owner@example.test", "is_owner": True}
 
 
 def test_other_signed_in_accounts_are_denied(monkeypatch):

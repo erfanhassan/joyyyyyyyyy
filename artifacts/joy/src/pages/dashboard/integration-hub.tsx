@@ -1,5 +1,9 @@
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
+import { WhatsAppConnection } from "@/components/whatsapp-connection";
+import { OperationalStatus } from "@/components/operational-status";
+import { PrivacyRequests } from "@/components/privacy-requests";
+import { WidgetOriginSettings } from "@/components/widget-origin-settings";
 import { Link } from "wouter";
 import {
   Share2,
@@ -40,6 +44,7 @@ interface IntegrationRecord {
 }
 
 export default function IntegrationHubPage() {
+  const widgetSession = useRef<{customer_id:string;token:string} | null>(null);
   const { tenantId } = useTenant();
 
   const [integrations, setIntegrations] = useState<IntegrationRecord[]>([]);
@@ -166,10 +171,11 @@ export default function IntegrationHubPage() {
     ].join(",");
 
     // Generate cryptographic CSRF state nonce
-    const oauthState = "joy_" + Math.random().toString(36).substring(2, 12) + Date.now().toString(36);
+    const oauthState = crypto.randomUUID();
     sessionStorage.setItem("joy_meta_oauth_state", oauthState);
+    sessionStorage.setItem("joy_meta_oauth_started_at", String(Date.now()));
 
-    const oauthUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(metaAppId)}&redirect_uri=${encodeURIComponent(
+    const oauthUrl = `https://www.facebook.com/v24.0/dialog/oauth?client_id=${encodeURIComponent(metaAppId)}&redirect_uri=${encodeURIComponent(
       redirectUri
     )}&scope=${encodeURIComponent(scopes)}&state=${encodeURIComponent(oauthState)}&response_type=token,granted_scopes`;
 
@@ -187,7 +193,10 @@ export default function IntegrationHubPage() {
           const returnedState = params.get("state");
           const expectedState = sessionStorage.getItem("joy_meta_oauth_state");
 
-          if (returnedState && returnedState !== expectedState) {
+          sessionStorage.removeItem("joy_meta_oauth_state");
+          const age = Date.now() - Number(sessionStorage.getItem("joy_meta_oauth_started_at") || 0);
+          sessionStorage.removeItem("joy_meta_oauth_started_at");
+          if (!returnedState || !expectedState || returnedState !== expectedState || age < 0 || age > 600000) {
             popup.close();
             clearInterval(interval);
             alert("Security Error: OAuth state parameter mismatch. Authorization rejected.");
@@ -466,22 +475,37 @@ export default function IntegrationHubPage() {
     setIsWidgetThinking(true);
 
     try {
+      let session = widgetSession.current;
+      if (!session) {
+      const sessionResponse = await fetch(apiUrl("/api/v1/widget/session"), {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({tenant_id: tenantId})
+      });
+      const created = await sessionResponse.json();
+      if (!sessionResponse.ok) throw new Error(created.detail || "Widget session failed.");
+      widgetSession.current = created;
+      session = created;
+      }
+      if (!session) throw new Error("Widget session unavailable.");
       const res = await fetch(apiUrl("/api/v1/widget/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           tenant_id: tenantId,
           session_id: `preview_widget_${Date.now()}`,
-          customer_id: "live_tester_001",
+          customer_id: session.customer_id,
+          visitor_token: session.token,
+          request_id: crypto.randomUUID(),
           message: userText,
         }),
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Widget request failed.");
       setWidgetMessages((prev) => [
         ...prev,
         {
           sender: "agent",
-          text: data.reply || "I am checking our catalog for you now.",
+          text: data.reply || "The specialist is paused or unavailable. Please contact the store.",
         },
       ]);
     } catch (e: any) {
@@ -529,6 +553,10 @@ export default function IntegrationHubPage() {
       )}
 
       {/* Integration Channels Grid */}
+      <WidgetOriginSettings />
+      <WhatsAppConnection />
+      <OperationalStatus />
+      <PrivacyRequests />
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         {/* ========================================== */}
         {/* 1. Meta / Instagram & Facebook             */}
@@ -852,7 +880,7 @@ export default function IntegrationHubPage() {
               <div className="flex items-center gap-2">
                 <h3 className="text-base font-semibold text-foreground">Universal Web Chat Embed Widget</h3>
                 <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-brand-50 text-brand-700 border border-brand-100">
-                  Ready to Deploy
+                  Embed code available
                 </span>
               </div>
               <p className="text-xs text-muted mt-0.5">

@@ -46,7 +46,8 @@ class OrderSyncService:
         if storefront_provider == "shopify" and storefront_api_url and access_token:
             try:
                 # Use current supported Shopify Admin REST API
-                api_version = "2024-10"
+                from app.core.config import settings
+                api_version = settings.SHOPIFY_API_VERSION
                 order_endpoint = f"{storefront_api_url.rstrip('/')}/admin/api/{api_version}/orders/{external_order_id}.json"
                 headers = {
                     "X-Shopify-Access-Token": access_token,
@@ -57,8 +58,12 @@ class OrderSyncService:
                     # First fetch current order to preserve existing tags
                     existing_tags = ""
                     get_resp = await client.get(order_endpoint, headers=headers)
-                    if get_resp.status_code == 200:
-                        existing_tags = get_resp.json().get("order", {}).get("tags", "")
+                    if get_resp.status_code != 200:
+                        return {"sync_status": "failed", "message": "Existing order could not be read safely; no fields were overwritten."}
+                    existing_order = get_resp.json().get("order", {})
+                    existing_tags = existing_order.get("tags", "")
+                    old_note = existing_order.get("note", "") or ""
+                    verification_note = f"Project JOY Voice Verification: {new_status.upper()}.\n{transcript_summary or ''}".strip()
 
                     combined_tags = f"{existing_tags}, {verification_tag}".strip(", ")
 
@@ -66,10 +71,10 @@ class OrderSyncService:
                         "order": {
                             "id": int(external_order_id) if external_order_id.isdigit() else external_order_id,
                             "tags": combined_tags,
-                            "note": f"Project JOY Voice Verification: {new_status.upper()}.\n{transcript_summary or ''}".strip(),
+                            "note": old_note if verification_note in old_note else f"{old_note}\n{verification_note}".strip(),
                         }
                     }
-                    if updated_address:
+                    if updated_address and new_status == "confirmed":
                         update_payload["order"]["shipping_address"] = {"address1": updated_address}
 
                     resp = await client.put(order_endpoint, headers=headers, json=update_payload)
@@ -106,10 +111,12 @@ class OrderSyncService:
                     headers["Authorization"] = f"Bearer {access_token}"
 
                 update_payload = {
-                    "status": woo_status,
-                    "customer_note": f"Project JOY Voice Verification: {new_status.upper()}.\n{transcript_summary or ''}".strip(),
+                    "meta_data": [
+                        {"key": "_joy_verification_status", "value": new_status},
+                        {"key": "_joy_verification_summary", "value": (transcript_summary or "")[:2000]},
+                    ],
                 }
-                if updated_address:
+                if updated_address and new_status == "confirmed":
                     update_payload["shipping"] = {"address_1": updated_address}
 
                 async with httpx.AsyncClient(timeout=15.0) as client:

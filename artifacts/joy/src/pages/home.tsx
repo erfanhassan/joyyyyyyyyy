@@ -92,10 +92,10 @@ export default function Home() {
             Autonomous Digital Staff for Retail &amp; E-Commerce
           </div>
           <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight text-foreground leading-[1.15] mb-4">
-            Hire AI staff to manage social sales &amp; confirm phone orders.
+            Manage social sales with a verified AI assistant.
           </h1>
           <p className="text-lg text-muted leading-relaxed mb-6">
-            Project JOY equips business owners with dedicated 24/7 digital employees. No technical training or complex prompt engineering required.
+            Connect your store and social channels, set operating hours, and keep a human in control. Phone confirmation is not yet available and requires a verified voice worker and SIP route.
           </p>
 
           {/* Quick Flow Actions */}

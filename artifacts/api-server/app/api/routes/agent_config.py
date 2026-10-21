@@ -59,7 +59,7 @@ async def list_tenant_agents(tenant_id: UUID, db: AsyncSession = Depends(get_db)
             tone_settings={"tone_slider": 75, "formality": 0.3, "enthusiasm": 0.8},
             max_discount_pct=10,
             operational_hours={"start": "00:00", "end": "23:59", "timezone": "Asia/Dhaka"},
-            is_active=True,
+            is_active=False,
         )
         emp2 = AgentConfig(
             id=uuid4(),
@@ -74,7 +74,7 @@ async def list_tenant_agents(tenant_id: UUID, db: AsyncSession = Depends(get_db)
             tone_settings={"tone_slider": 50, "formality": 0.7, "enthusiasm": 0.5},
             max_discount_pct=0,
             operational_hours={"start": "08:00", "end": "21:00", "timezone": "Asia/Dhaka"},
-            is_active=True,
+            is_active=False,
         )
         db.add_all([emp1, emp2])
         await db.commit()
@@ -136,6 +136,8 @@ async def update_agent_config(
     if payload.system_prompt is not None:
         agent.system_prompt = payload.system_prompt
     if payload.is_active is not None:
+        if payload.is_active and agent.agent_type != "social_sales":
+            raise HTTPException(409, "This employee is not available for production activation.")
         agent.is_active = payload.is_active
 
     await db.commit()
@@ -160,6 +162,8 @@ async def create_new_digital_employee(
     db: AsyncSession = Depends(get_db),
 ):
     """Hires a new specialized digital employee and registers their record in PostgreSQL."""
+    if payload.agent_type != "social_sales":
+        raise HTTPException(409, "Only Social Sales is available. Phone and other roles require additional deployment and provider setup.")
     new_agent = AgentConfig(
         id=uuid4(),
         tenant_id=tenant_id,

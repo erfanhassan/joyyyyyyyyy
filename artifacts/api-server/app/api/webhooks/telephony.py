@@ -2,7 +2,7 @@ import logging
 import uuid
 from typing import Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +29,7 @@ class TelephonyCompletionPayload(BaseModel):
 @router.post("/completion")
 async def handle_telephony_completion(
     payload: TelephonyCompletionPayload,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -36,6 +37,18 @@ async def handle_telephony_completion(
     Stores audio transcript, updates order status to 'confirmed' or 'flagged_for_review',
     and syncs verification tags to Shopify/WooCommerce.
     """
+    import time, hmac, hashlib
+    from app.core.config import settings
+    stamp = request.headers.get("x-joy-timestamp", "")
+    signature = request.headers.get("x-joy-signature", "")
+    try:
+        fresh = abs(time.time() - int(stamp)) <= 300
+    except ValueError:
+        fresh = False
+    expected = hmac.new(settings.LIVEKIT_API_SECRET.encode(),
+                        stamp.encode() + b"." + await request.body(), hashlib.sha256).hexdigest()
+    if not settings.LIVEKIT_API_SECRET or not fresh or not hmac.compare_digest(signature, expected):
+        raise HTTPException(401, "Invalid signed telephony callback.")
     logger.info(
         f"[Telephony Webhook] Processing completion for Order {payload.order_id or payload.call_id} "
         f"(confirmed={payload.order_confirmed}, flagged={payload.flagged_for_review})"
@@ -64,19 +77,7 @@ async def handle_telephony_completion(
         order = res.scalars().first()
 
     if not order:
-        order = Order(
-            id=payload.order_id or uuid.uuid4(),
-            tenant_id=payload.tenant_id,
-            external_order_id=payload.call_id[:12],
-            storefront_provider="custom",
-            customer_name="Customer",
-            customer_phone=payload.customer_phone or "+8801700000000",
-            shipping_address=payload.updated_shipping_address or "Dhaka, Bangladesh",
-            order_total=2500.0,
-            status=new_status,
-        )
-        db.add(order)
-        await db.flush()
+        raise HTTPException(404, "Callback does not match an existing order; no synthetic order was created.")
 
     # 3. Update Order
     order.status = new_status
@@ -164,7 +165,9 @@ async def verify_order_via_link(
         )
 
     # 2. Validate HMAC Signature
-    secret = settings.ENCRYPTION_KEY_SECRET or "joy_order_verify_secret_2026"
+    secret = settings.ENCRYPTION_KEY_SECRET
+    if len(secret) < 32:
+        raise HTTPException(503, "Secure order verification is not configured.")
     expected_sig = hmac.new(secret.encode(), f"{order_id}:{exp}".encode(), hashlib.sha256).hexdigest()[:16]
 
     if not hmac.compare_digest(sig, expected_sig):

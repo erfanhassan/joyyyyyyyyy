@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.services.rag_service import RAGService
@@ -19,9 +19,9 @@ class CrawlRequest(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=4000)
     tenant_id: UUID
-    top_k: int = 3
+    top_k: int = Field(default=3, ge=1, le=20)
 
 
 @router.post("/upload")
@@ -35,7 +35,10 @@ async def upload_document(
     Parses content, splits into recursive 500-token chunks, and indexes via pgvector HNSW.
     """
     filename = file.filename or "uploaded_document"
-    file_bytes = await file.read()
+    from app.core.config import settings
+    file_bytes = await file.read(settings.MAX_UPLOAD_BYTES + 1)
+    if len(file_bytes) > settings.MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Maximum upload size is 25 MB.")
 
     if filename.lower().endswith(".pdf"):
         source_type = "pdf"

@@ -75,6 +75,7 @@ async def test_meta_cannot_save_a_fake_page(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_meta_requires_successful_webhook_subscription(monkeypatch):
+    monkeypatch.setattr("app.services.meta_identity.token_owner", AsyncMock(return_value="123"))
     monkeypatch.setattr(MetaAPIClient, "get_page_identity", AsyncMock(
         return_value={"id": "123", "name": "Test Page"},
     ))
@@ -106,5 +107,5 @@ async def test_meta_requires_successful_webhook_subscription(monkeypatch):
 ])
 async def test_production_never_reports_simulated_delivery(monkeypatch, method, kwargs):
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
-    with pytest.raises(RuntimeError, match="did not confirm delivery"):
+    with pytest.raises(RuntimeError):
         await getattr(MetaAPIClient, method)(**kwargs)

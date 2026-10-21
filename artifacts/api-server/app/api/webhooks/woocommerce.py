@@ -24,7 +24,10 @@ async def process_woocommerce_background(payload: dict, topic: str, tenant_id: s
     from app.db.models import Order, TenantIntegration, Tenant
     from app.agents.voice_confirmation import VoiceConfirmationAgent
 
+    if tenant_id == "default":
+        raise RuntimeError("A verified store-to-workspace mapping is required.")
     async with AsyncSessionLocal() as db:
+        db.info["tenant_id"] = tenant_id
         try:
             # 1. Resolve Tenant UUID
             tenant_uuid = None
@@ -62,7 +65,7 @@ async def process_woocommerce_background(payload: dict, topic: str, tenant_id: s
             last_name = billing.get("last_name") or shipping.get("last_name") or ""
             customer_name = f"{first_name} {last_name}".strip() or "WooCommerce Customer"
 
-            phone = billing.get("phone") or shipping.get("phone") or "+8801700000000"
+            phone = billing.get("phone") or shipping.get("phone") or ""
 
             address_parts = [
                 shipping.get("address_1") or billing.get("address_1"),
@@ -81,6 +84,7 @@ async def process_woocommerce_background(payload: dict, topic: str, tenant_id: s
             stmt = select(Order).where(
                 Order.tenant_id == tenant_uuid,
                 Order.external_order_id == ext_order_id,
+                Order.storefront_provider == "woocommerce",
             )
             order_res = await db.execute(stmt)
             order = order_res.scalars().first()
@@ -102,21 +106,19 @@ async def process_woocommerce_background(payload: dict, topic: str, tenant_id: s
                 await db.refresh(order)
                 logger.info(f"Persisted new WooCommerce order {order.id} (ext: {ext_order_id}) in database")
 
-            # 4. Trigger Voice Confirmation Workflow
-            confirm_res = await VoiceConfirmationAgent.process_order_confirmation(
-                order_id=order.id,
-                tenant_id=tenant_uuid,
-                db=db,
-            )
-            logger.info(f"WooCommerce order {order.id} confirmation result: {confirm_res}")
+            if order.status == "pending_verification":
+                order.customer_name = customer_name
+                order.customer_phone = phone
+                order.shipping_address = shipping_address
+                order.order_total = total_val
+                await db.commit()
 
             # 5. Mark Event Completed
-            await IdempotencyService.mark_event_completed(str(tenant_uuid), event_id)
+            # Durable inbox completion is recorded by the worker.
 
         except Exception as e:
             logger.error(f"Error processing WooCommerce order webhook {event_id}: {e}", exc_info=True)
-            if tenant_uuid:
-                await IdempotencyService.release_event_lock(str(tenant_uuid), event_id)
+            raise
 
 
 @router.post("")
@@ -134,16 +136,9 @@ async def receive_woocommerce_webhook(
     Validates HMAC signature using WOOCOMMERCE_WEBHOOK_SECRET and deduplicates via Redis SETNX.
     """
     raw_body = await request.body()
-
-    # 1. HMAC-SHA256 Signature Verification
-    if settings.WOOCOMMERCE_WEBHOOK_SECRET:
-        is_valid = verify_woocommerce_signature(raw_body, x_wc_webhook_signature, settings.WOOCOMMERCE_WEBHOOK_SECRET)
-        if not is_valid:
-            logger.warning(f"Invalid WooCommerce HMAC signature for tenant {tenant_id}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid WooCommerce HMAC signature",
-            )
+    from app.services.store_webhooks import authenticate_store
+    verified_tenant_id = await authenticate_store(
+        request, "woocommerce", tenant_id, raw_body, x_wc_webhook_signature)
 
     # 2. Parse Payload
     try:
@@ -159,13 +154,10 @@ async def receive_woocommerce_webhook(
         import hashlib
         event_id = hashlib.sha256(raw_body).hexdigest()[:16]
 
-    # 4. Redis SETNX 24-Hour Deduplication
-    is_new = await IdempotencyService.check_and_set_event(tenant_id, event_id)
-    if not is_new:
-        return {"status": "duplicate_ignored", "event_id": event_id}
-
-    # 5. Dispatch to Background Worker
-    background_tasks.add_task(process_woocommerce_background, payload, x_wc_webhook_topic, tenant_id, event_id)
+    from app.db.session import AsyncSessionLocal
+    from app.services.webhook_jobs import resolve_integration, enqueue
+    async with AsyncSessionLocal() as db:
+        created = await enqueue(db, "woocommerce", verified_tenant_id, event_id, payload, x_wc_webhook_topic)
 
     # 6. Immediate Response (<1500ms)
-    return {"status": "received", "event_id": event_id, "topic": x_wc_webhook_topic, "tenant_id": tenant_id}
+    return {"status": "received" if created else "duplicate_ignored", "event_id": event_id, "topic": x_wc_webhook_topic, "tenant_id": str(verified_tenant_id)}

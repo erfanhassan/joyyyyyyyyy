@@ -113,7 +113,7 @@ async def _verified_primary_email(user_id: str) -> str | None:
     return normalized
 
 
-async def authenticate_owner(scope) -> dict[str, str]:
+async def authenticate_owner(scope, require_owner: bool = True) -> dict:
     headers = Headers(scope=scope)
     origin = _authorized_origin(headers)
     if not origin:
@@ -143,7 +143,7 @@ async def authenticate_owner(scope) -> dict[str, str]:
         raise ClerkAuthFailure(503, "Sign-in verification is temporarily unavailable.") from None
 
     owner_email = settings.JOY_INITIAL_ADMIN_EMAIL.strip().casefold()
-    if not email or email != owner_email:
+    if not email or (require_owner and email != owner_email):
         raise ClerkAuthFailure(403, "This account is not authorized to administer JOY.")
 
-    return {"user_id": user_id}
+    return {"user_id": user_id, "email": email, "is_owner": email == owner_email}

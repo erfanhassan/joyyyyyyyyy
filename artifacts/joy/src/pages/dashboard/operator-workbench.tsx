@@ -391,7 +391,7 @@ export default function OperatorWorkbenchPage() {
       </div>
 
       {/* Interactive Simulation Lab Bar */}
-      <div className="bg-white border border-border rounded-xl p-4 shadow-sm">
+      {import.meta.env.DEV && <div className="bg-white border border-border rounded-xl p-4 shadow-sm">
         <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
           <div className="flex items-center gap-2">
             <div className="w-6 h-6 rounded-md bg-brand-50 border border-brand-100 flex items-center justify-center text-brand-700">
@@ -469,7 +469,7 @@ export default function OperatorWorkbenchPage() {
             </div>
           </button>
         </div>
-      </div>
+      </div>}
 
       {/* HITL Sentiment Interrupt Banner */}
       {alertBanner && (

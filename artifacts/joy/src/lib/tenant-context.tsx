@@ -22,11 +22,9 @@ interface TenantContextValue {
   updateTenant: (updates: Partial<TenantProfile>) => Promise<boolean>;
 }
 
-const FALLBACK_TENANT_ID = "a1e6f58d-b575-420e-b4d6-1fef0064e746";
-
 const TenantContext = createContext<TenantContextValue>({
   tenant: null,
-  tenantId: FALLBACK_TENANT_ID,
+  tenantId: "",
   isLoading: true,
   error: null,
   refetchTenant: async () => {},
@@ -37,6 +35,9 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [tenant, setTenant] = useState<TenantProfile | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+  const [needsWorkspace, setNeedsWorkspace] = useState(false);
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
 
   const fetchTenant = async () => {
     setIsLoading(true);
@@ -46,16 +47,14 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         const data = await res.json();
         setTenant(data);
         setError(null);
+        setNeedsWorkspace(false);
       } else {
-        // Fallback to fetching default tenant profile
-        const fallbackRes = await fetch(apiUrl(`/api/v1/tenant/${FALLBACK_TENANT_ID}`));
-        if (fallbackRes.ok) {
-          const fallbackData = await fallbackRes.json();
-          setTenant(fallbackData);
-        }
+        setTenant(null);
+        setNeedsWorkspace(res.status === 404);
+        const problem = await res.json();
+        throw new Error(problem.detail || "Could not load your workspace.");
       }
     } catch (err: any) {
-      console.warn("Failed to resolve dynamic workspace, using local storefront context:", err);
       setError(err);
     } finally {
       setIsLoading(false);
@@ -67,7 +66,8 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   }, []);
 
   const updateTenant = async (updates: Partial<TenantProfile>): Promise<boolean> => {
-    const targetId = tenant?.id || FALLBACK_TENANT_ID;
+    if (!tenant?.id) return false;
+    const targetId = tenant.id;
     try {
       const res = await fetch(apiUrl(`/api/v1/tenant/${targetId}`), {
         method: "PUT",
@@ -90,7 +90,35 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   };
 
-  const tenantId = tenant?.id || FALLBACK_TENANT_ID;
+  const tenantId = tenant?.id || "";
+
+  if (isLoading) return <div className="p-8 text-sm text-muted-foreground" role="status">Loading your workspace…</div>;
+  if (!tenant) return (
+    <section className="m-8 max-w-lg rounded-xl border bg-card p-6">
+      <h1 className="text-xl font-semibold">{needsWorkspace ? "Create your business workspace" : "Workspace unavailable"}</h1>
+      {error && <p role="alert" className="my-4 text-sm text-destructive">{error.message}</p>}
+      {needsWorkspace ? <form onSubmit={async (event) => {
+        event.preventDefault();
+        setIsCreating(true);
+        try {
+          const response = await fetch(apiUrl("/api/v1/tenant/onboard"), {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({name: workspaceName.trim(), currency: "BDT", timezone: "Asia/Dhaka"})
+          });
+          if (!response.ok) throw new Error((await response.json()).detail || "Could not create workspace.");
+          await fetchTenant();
+        } catch (problem) {
+          setError(problem instanceof Error ? problem : new Error("Could not create workspace."));
+        } finally { setIsCreating(false); }
+      }}>
+        <label className="block text-sm font-medium" htmlFor="workspace-name">Business name</label>
+        <input id="workspace-name" className="my-3 w-full rounded-md border bg-background p-2"
+          value={workspaceName} onChange={event => setWorkspaceName(event.target.value)} required maxLength={150} />
+        <button className="rounded-md bg-primary px-4 py-2 text-primary-foreground disabled:opacity-50"
+          disabled={isCreating || !workspaceName.trim()}>{isCreating ? "Creating…" : "Create workspace"}</button>
+      </form> : <button className="rounded-md border px-4 py-2" onClick={fetchTenant}>Retry</button>}
+    </section>
+  );
 
   return (
     <TenantContext.Provider

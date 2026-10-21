@@ -25,13 +25,18 @@ def is_public_route(path: str, method: str) -> bool:
     if path in ("/api/widget/widget.js", "/api/v1/widget/widget.js"):
         return method == "GET"
     if path in ("/api/widget/chat", "/api/v1/widget/chat"):
-        return method == "POST"
+        return method in ("POST", "OPTIONS")
+    if path in ("/api/widget/session", "/api/v1/widget/session"):
+        return method in ("POST", "OPTIONS")
+    if path in ("/api/widget/messages", "/api/v1/widget/messages"):
+        return method in ("GET", "OPTIONS")
     # Only providers that already verify signatures may receive public webhooks.
     prefix = "/api/v1/webhooks/"
     if path.startswith(prefix):
         provider = path[len(prefix):].split("/", 1)[0]
         secrets = {
             "meta": settings.META_APP_SECRET,
+            "meta-privacy": settings.META_APP_SECRET,
             "shopify": settings.SHOPIFY_API_SECRET,
             "woocommerce": settings.WOOCOMMERCE_WEBHOOK_SECRET,
             "custom": settings.SHOPIFY_API_SECRET or settings.ENCRYPTION_KEY_SECRET,
@@ -41,6 +46,12 @@ def is_public_route(path: str, method: str) -> bool:
                 settings.META_VERIFY_TOKEN
                 and settings.META_VERIFY_TOKEN != "joy_meta_verify_token_default"
             )
+        if provider in ("shopify", "woocommerce"):
+            return method == "POST"  # Each store verifies its own signed secret.
+        if provider == "meta-privacy":
+            if method == "GET" and "/status/" in path:
+                return True
+            return method == "POST" and path.rsplit("/",1)[-1] in ("delete","deauthorize") and bool(settings.META_APP_SECRET)
         return method == "POST" and bool(secrets.get(provider))
     return False
 
@@ -76,7 +87,8 @@ class DeploymentGuard:
                 return
 
             try:
-                identity = await authenticate_owner(scope)
+                identity = (await authenticate_owner(scope, require_owner=False)
+                            if settings.ALLOW_PUBLIC_SIGNUPS else await authenticate_owner(scope))
             except ClerkAuthFailure as exc:
                 if scope_type == "websocket":
                     await send({"type": "websocket.close", "code": 1008})
@@ -88,10 +100,34 @@ class DeploymentGuard:
                     await response(scope, receive, send)
                 return
 
+            if scope_type == "websocket" and not identity.get("is_owner", False):
+                if not await member_websocket_allowed(path, identity["user_id"]):
+                    await send({"type":"websocket.close","code":1008})
+                    return
+
             scope.setdefault("state", {}).update(
                 {
                     "clerk_user_id": identity["user_id"],
-                    "is_joy_owner": True,
+                    "clerk_email": identity.get("email", ""),
+                    "is_joy_owner": identity.get("is_owner", False),
                 }
             )
         await self.app(scope, receive, send)
+
+
+async def member_websocket_allowed(path, subject):
+    """WebSocket routes do not inherit the HTTP get_db membership dependency."""
+    from uuid import UUID
+    from sqlalchemy import select
+    from app.db.models import WorkspaceIdentity
+    from app.db.session import AsyncSessionLocal
+    if not path.startswith("/ws/workbench/"):
+        return False
+    try:
+        tenant=UUID(path.rsplit("/",1)[-1])
+    except ValueError:
+        return False
+    async with AsyncSessionLocal() as db:
+        membership=(await db.execute(select(WorkspaceIdentity).where(
+            WorkspaceIdentity.clerk_user_id==subject,WorkspaceIdentity.tenant_id==tenant))).scalar_one_or_none()
+        return membership is not None

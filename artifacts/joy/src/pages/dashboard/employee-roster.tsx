@@ -279,12 +279,12 @@ export default function EmployeeRosterPage() {
                     }`}
                   >
                     <span className={`w-1.5 h-1.5 rounded-full ${emp.is_active ? "bg-brand-600 animate-pulse" : "bg-muted"}`} />
-                    <span>{emp.is_active ? "Active On Duty" : "Paused"}</span>
+                    <span>{emp.agent_type !== "social_sales" ? "Unavailable — setup required" : emp.is_active ? "Active On Duty" : "Paused"}</span>
                   </button>
 
                   <button
                     onClick={() => handleSaveGuardrails(emp)}
-                    disabled={isSaving}
+                    disabled={isSaving || emp.agent_type !== "social_sales"}
                     className="px-3.5 py-1.5 bg-foreground hover:bg-foreground/90 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shadow-sm"
                   >
                     <Save className="w-3.5 h-3.5" />
@@ -453,6 +453,7 @@ export default function EmployeeRosterPage() {
                     <div
                       key={tmpl.type}
                       onClick={() => {
+                        if (tmpl.type !== "social_sales") return;
                         setSelectedTemplate(tmpl.type);
                         setNewEmployeeDiscount(tmpl.defaultDiscount);
                       }}
@@ -463,6 +464,7 @@ export default function EmployeeRosterPage() {
                       }`}
                     >
                       <div className="flex items-center justify-between font-semibold text-foreground">
+                        {tmpl.type !== "social_sales" && <span className="text-muted">Unavailable</span>}
                         <div className="flex items-center gap-2">
                           <span>{tmpl.name}</span>
                           {tmpl.isRoadmap && (
@@ -489,6 +491,7 @@ export default function EmployeeRosterPage() {
               </button>
               <button
                 onClick={handleHireEmployee}
+                disabled={isSaving || selectedTemplate !== "social_sales"}
                 className="px-4 py-2 bg-foreground text-white rounded-lg text-xs font-semibold hover:bg-foreground/90 transition-colors shadow-sm"
               >
                 Onboard to Database

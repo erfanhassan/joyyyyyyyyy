@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.core.deployment_guard import is_public_deployment
 
 logger = logging.getLogger("joy.meta_api")
-GRAPH_API_VERSION = "v19.0"
+GRAPH_API_VERSION = "v24.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
@@ -31,14 +31,15 @@ class MetaAPIClient:
                 response = await client.get(
                     f"{GRAPH_API_BASE}/{page_id}",
                     headers={"Authorization": f"Bearer {page_access_token}"},
-                    params={"fields": "id,name"},
+                    params={"fields": "id,name,instagram_business_account{id,username}"},
                 )
             if response.status_code != 200:
                 raise HTTPException(status_code=400, detail="Meta rejected the Page credentials or permissions. Reconnect the Page.")
             data = response.json()
             if data.get("id") != page_id or not data.get("name"):
                 raise HTTPException(status_code=400, detail="The token does not identify the selected Facebook Page.")
-            return {"id": data["id"], "name": data["name"]}
+            return {"id": data["id"], "name": data["name"],
+                    "instagram_business_account": data.get("instagram_business_account") or {}}
         except (httpx.HTTPError, ValueError):
             raise HTTPException(status_code=502, detail="Meta could not be reached or returned an invalid response. Retry later.") from None
 
@@ -148,31 +149,8 @@ class MetaAPIClient:
         page_access_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send direct message on Facebook Messenger."""
-        token = page_access_token
-        logger.info(f"[Meta API] Sending Messenger DM to {recipient_id}: '{message_text[:60]}...'")
-
-        # If live token present and not mock
-        if token and not token.startswith(("joy_", "mock_", "test_")):
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{GRAPH_API_BASE}/me/messages",
-                    params={"access_token": token},
-                    json={
-                        "recipient": {"id": recipient_id},
-                        "message": {"text": message_text},
-                    },
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.error(f"Meta Messenger API error: {resp.text}")
-
-        # Simulated response for testing / sandbox
-        MetaAPIClient.require_delivery_confirmation()
-        return {
-            "recipient_id": recipient_id,
-            "message_id": f"mid_fb_{recipient_id[:8]}",
-            "status": "sent_simulated",
-        }
+        return await MetaAPIClient.confirmed_post("me/messages", page_access_token, {
+            "recipient":{"id":recipient_id}, "message":{"text":message_text}, "messaging_type":"RESPONSE"})
 
     @staticmethod
     async def send_instagram_dm(
@@ -181,57 +159,21 @@ class MetaAPIClient:
         page_access_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send direct message on Instagram Direct."""
-        token = page_access_token
-        logger.info(f"[Meta API] Sending Instagram DM to {recipient_id}: '{message_text[:60]}...'")
-
-        if token and not token.startswith(("joy_", "mock_", "test_")):
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{GRAPH_API_BASE}/me/messages",
-                    params={"access_token": token},
-                    json={
-                        "recipient": {"id": recipient_id},
-                        "message": {"text": message_text},
-                    },
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.error(f"Meta Instagram API error: {resp.text}")
-
-        MetaAPIClient.require_delivery_confirmation()
-        return {
-            "recipient_id": recipient_id,
-            "message_id": f"mid_ig_{recipient_id[:8]}",
-            "status": "sent_simulated",
-        }
+        return await MetaAPIClient.confirmed_post("me/messages", page_access_token, {
+            "recipient":{"id":recipient_id}, "message":{"text":message_text}})
 
     @staticmethod
     async def reply_public_comment(
         comment_id: str,
         message_text: str,
         page_access_token: Optional[str] = None,
+        channel: str = "instagram",
     ) -> Dict[str, Any]:
         """Publish a public reply to an Instagram or Facebook post/Reels comment."""
-        token = page_access_token
-        logger.info(f"[Meta API] Replying publicly to comment {comment_id}: '{message_text}'")
-
-        if token and not token.startswith(("joy_", "mock_", "test_")):
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{GRAPH_API_BASE}/{comment_id}/replies",
-                    params={"access_token": token},
-                    json={"message": message_text},
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.error(f"Meta Comment Reply API error: {resp.text}")
-
-        MetaAPIClient.require_delivery_confirmation()
-        return {
-            "comment_id": comment_id,
-            "reply_id": f"rep_{comment_id[:8]}",
-            "status": "published_simulated",
-        }
+        if not comment_id.replace("_", "").isdigit():
+            raise RuntimeError("Invalid comment identifier.")
+        suffix = "replies" if channel == "instagram" else "comments"
+        return await MetaAPIClient.confirmed_post(f"{comment_id}/{suffix}", page_access_token, {"message":message_text})
 
     @staticmethod
     async def send_comment_to_dm_handshake(
@@ -245,39 +187,22 @@ class MetaAPIClient:
         Implements the Meta 24-hour Comment-to-DM Handshake: includes a high-converting
         CTA prompt so the customer replies in DM, unlocking the 24-hour sales window.
         """
-        token = page_access_token
-        logger.info(f"[Meta API] Sending Comment-to-DM Handshake for comment {comment_id}")
+        # Plain text private replies are supported without claiming a discount
+        # or promising a button that the provider has not actually rendered.
+        return await MetaAPIClient.confirmed_post("me/messages", page_access_token, {
+            "recipient":{"comment_id":comment_id}, "message":{"text":private_message_text}})
 
-        full_message = f"{private_message_text}\n\n👉 Tap below to claim your discount:\n{cta_button_text}"
-
-        if token and not token.startswith(("joy_", "mock_", "test_")):
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # Meta Private Reply endpoint
-                resp = await client.post(
-                    f"{GRAPH_API_BASE}/me/messages",
-                    params={"access_token": token},
-                    json={
-                        "recipient": {"comment_id": comment_id},
-                        "message": {
-                            "text": full_message,
-                            "quick_replies": [
-                                {
-                                    "content_type": "text",
-                                    "title": cta_button_text[:20],
-                                    "payload": "HANDSHAKE_CONFIRMED",
-                                }
-                            ],
-                        },
-                    },
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.error(f"Meta Comment-to-DM API error: {resp.text}")
-
-        MetaAPIClient.require_delivery_confirmation()
-        return {
-            "comment_id": comment_id,
-            "message_id": f"mid_dm_handshake_{comment_id[:8]}",
-            "status": "handshake_sent_simulated",
-            "cta": cta_button_text,
-        }
+    @staticmethod
+    async def confirmed_post(path, token, payload):
+        if not token or token.startswith(("joy_", "mock_", "test_")):
+            raise RuntimeError("A verified Meta connection is required; no message was simulated.")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(f"{GRAPH_API_BASE}/{path}",
+                    headers={"Authorization":f"Bearer {token}"}, json=payload)
+            data = response.json()
+        except (httpx.HTTPError, ValueError):
+            raise RuntimeError("Meta delivery could not be confirmed.") from None
+        if response.status_code not in (200,201) or data.get("error") or not (data.get("id") or data.get("message_id")):
+            raise RuntimeError("Meta rejected the message or did not return a delivery identifier.")
+        return data

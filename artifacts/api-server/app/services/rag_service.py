@@ -11,6 +11,8 @@ from sqlalchemy import select, text, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import KnowledgeDocument, DocumentChunk
 from app.services.embedding_service import EmbeddingService
+from app.core.safety import public_url, PublicTransport
+from app.core.config import settings
 
 logger = logging.getLogger("joy.rag")
 
@@ -35,10 +37,24 @@ class RAGService:
         headers = {
             "User-Agent": "JoyStorefrontCrawler/1.0 (+https://joy.ai; bot@joy.ai)"
         }
-        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            html = response.text
+        # Disable redirects: a public URL must not redirect into private services.
+        await public_url(url)
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=False, trust_env=False, transport=PublicTransport()) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.is_redirect:
+                    from fastapi import HTTPException
+                    raise HTTPException(400, "Redirects are not crawled. Supply the final public HTTPS URL.")
+                response.raise_for_status()
+                if "text/html" not in response.headers.get("content-type", ""):
+                    from fastapi import HTTPException
+                    raise HTTPException(400, "Storefront crawling requires an HTML page.")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > settings.MAX_CRAWL_BYTES:
+                        from fastapi import HTTPException
+                        raise HTTPException(413, "Storefront page exceeds the 2 MB crawl limit.")
+                html = body.decode("utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "html.parser")
 
@@ -66,6 +82,8 @@ class RAGService:
     def parse_pdf_bytes(file_bytes: bytes) -> str:
         """Extract text from an uploaded PDF file."""
         reader = PdfReader(io.BytesIO(file_bytes))
+        if len(reader.pages) > 200:
+            raise ValueError("PDFs are limited to 200 pages.")
         pages_text = []
         for i, page in enumerate(reader.pages):
             text_val = page.extract_text()
@@ -82,6 +100,8 @@ class RAGService:
         reader = csv.DictReader(text_stream)
         rows_text = []
         for i, row in enumerate(reader):
+            if i >= 10000:
+                raise ValueError("CSV files are limited to 10,000 rows.")
             # Format row as key-value pairs
             row_items = [f"{k.strip()}: {v.strip()}" for k, v in row.items() if k and v]
             rows_text.append(f"Item #{i + 1}:\n" + "\n".join(row_items))
@@ -184,6 +204,9 @@ class RAGService:
 
         # 2. Chunk text
         chunks = RAGService.chunk_text(content)
+        if len(chunks) > settings.MAX_DOCUMENT_CHUNKS:
+            from fastapi import HTTPException
+            raise HTTPException(413, "Document exceeds the 500-chunk indexing limit. Split it into smaller documents.")
         if not chunks:
             return {"document_id": str(doc.id), "chunks_count": 0}
 

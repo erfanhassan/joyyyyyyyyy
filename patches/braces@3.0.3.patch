@@ -1,0 +1,20 @@
+diff --git a/lib/parse.js b/lib/parse.js
+index 3a6988e629f52aee6609dc5ec290a5e9ff47cecb..18a85baf08222c71ca7fd61023b944dbc3f110b9 100644
+--- a/lib/parse.js
++++ b/lib/parse.js
+@@ -74,6 +74,15 @@ const parse = (input, options = {}) => {
+   push({ type: 'bos' });
+ 
+   while (index < length) {
++    // Bound every AST produced from a string before recursive compile/expand/
++    // stringify walkers can see it. Treat excessive nesting as a literal,
++    // escaped expression rather than throwing an uncaught stack overflow.
++    if (stack.length > 128) {
++      return {
++        type: 'root', input,
++        nodes: [{ type: 'text', value: input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }]
++      };
++    }
+     block = stack[stack.length - 1];
+     value = advance();
+ 

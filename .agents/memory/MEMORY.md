@@ -1,3 +1,4 @@
 - [Migration boundaries](migration-boundaries.md) — preserve the imported Python backend and original design; the empty database scaffold is not authoritative.
 - [HTTP proxy encoding](http-proxy-encoding.md) — preserve compressed bytes and Content-Encoding together; successful health checks do not prove browser scripts can execute.
 - [GitHub access and sync](github-repository-permissions.md) — canonical JOY repository, active remote verification, and limits of GitHub API versus Git transport permissions.
+- [Async database tests](async-database-tests.md) — isolate fixture engines across event loops and reuse the application's normalized driver URL.

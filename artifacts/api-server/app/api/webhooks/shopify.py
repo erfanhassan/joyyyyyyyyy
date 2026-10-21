@@ -24,7 +24,10 @@ async def process_shopify_background(payload: dict, topic: str, tenant_id: str, 
     from app.db.models import Order, TenantIntegration, Tenant
     from app.agents.voice_confirmation import VoiceConfirmationAgent
 
+    if tenant_id == "default":
+        raise RuntimeError("A verified store-to-workspace mapping is required.")
     async with AsyncSessionLocal() as db:
+        db.info["tenant_id"] = tenant_id
         try:
             # 1. Resolve Tenant UUID
             tenant_uuid = None
@@ -68,7 +71,7 @@ async def process_shopify_background(payload: dict, topic: str, tenant_id: str, 
                 or billing.get("phone")
                 or customer.get("phone")
                 or payload.get("phone")
-                or "+8801700000000"
+                or ""
             )
 
             address_parts = [
@@ -91,6 +94,7 @@ async def process_shopify_background(payload: dict, topic: str, tenant_id: str, 
             stmt = select(Order).where(
                 Order.tenant_id == tenant_uuid,
                 Order.external_order_id == ext_order_id,
+                Order.storefront_provider == "shopify",
             )
             order_res = await db.execute(stmt)
             order = order_res.scalars().first()
@@ -112,21 +116,19 @@ async def process_shopify_background(payload: dict, topic: str, tenant_id: str, 
                 await db.refresh(order)
                 logger.info(f"Persisted new Shopify order {order.id} (ext: {ext_order_id}) in database")
 
-            # 4. Trigger Voice Confirmation Workflow
-            confirm_res = await VoiceConfirmationAgent.process_order_confirmation(
-                order_id=order.id,
-                tenant_id=tenant_uuid,
-                db=db,
-            )
-            logger.info(f"Shopify order {order.id} confirmation result: {confirm_res}")
+            # Incoming order notifications do not grant consent to call.
+            if order.status == "pending_verification":
+                order.customer_name = customer_name
+                order.customer_phone = phone
+                order.shipping_address = shipping_address
+                order.order_total = total_val
+                await db.commit()
 
-            # 5. Mark Event Completed
-            await IdempotencyService.mark_event_completed(str(tenant_uuid), event_id)
+            # Durable inbox completion is recorded by the worker.
 
         except Exception as e:
             logger.error(f"Error processing Shopify order webhook {event_id}: {e}", exc_info=True)
-            if tenant_uuid:
-                await IdempotencyService.release_event_lock(str(tenant_uuid), event_id)
+            raise
 
 
 @router.post("")
@@ -144,16 +146,9 @@ async def receive_shopify_webhook(
     Validates HMAC signature using SHOPIFY_API_SECRET and drops duplicates via Redis SETNX.
     """
     raw_body = await request.body()
-
-    # 1. HMAC-SHA256 Signature Verification
-    if settings.SHOPIFY_API_SECRET:
-        is_valid = verify_shopify_signature(raw_body, x_shopify_hmac_sha256, settings.SHOPIFY_API_SECRET)
-        if not is_valid:
-            logger.warning(f"Invalid Shopify HMAC signature for tenant {tenant_id}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid Shopify HMAC signature",
-            )
+    from app.services.store_webhooks import authenticate_store
+    verified_tenant_id = await authenticate_store(
+        request, "shopify", tenant_id, raw_body, x_shopify_hmac_sha256)
 
     # 2. Parse Payload
     try:
@@ -169,13 +164,10 @@ async def receive_shopify_webhook(
         import hashlib
         event_id = hashlib.sha256(raw_body).hexdigest()[:16]
 
-    # 4. Redis SETNX 24-Hour Deduplication
-    is_new = await IdempotencyService.check_and_set_event(tenant_id, event_id)
-    if not is_new:
-        return {"status": "duplicate_ignored", "event_id": event_id}
-
-    # 5. Dispatch to Background Worker
-    background_tasks.add_task(process_shopify_background, payload, x_shopify_topic, tenant_id, event_id)
+    from app.db.session import AsyncSessionLocal
+    from app.services.webhook_jobs import resolve_integration, enqueue
+    async with AsyncSessionLocal() as db:
+        created = await enqueue(db, "shopify", verified_tenant_id, event_id, payload, x_shopify_topic)
 
     # 6. Immediate Response (<1500ms)
-    return {"status": "received", "event_id": event_id, "topic": x_shopify_topic, "tenant_id": tenant_id}
+    return {"status": "received" if created else "duplicate_ignored", "event_id": event_id, "topic": x_shopify_topic, "tenant_id": str(verified_tenant_id)}

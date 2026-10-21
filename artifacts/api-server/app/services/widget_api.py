@@ -194,8 +194,65 @@ class WidgetAPIService:
   var input = document.getElementById('joy-input');
   var sendBtn = document.getElementById('joy-send-btn');
   var container = document.getElementById('joy-msg-container');
+  var session = null;
+  var cursor = '';
+  var seenMessages = Object.create(null);
+  function jsonResponse(r) {{
+    return r.json().then(function(data) {{
+      if (!r.ok) throw new Error(data.detail || 'Chat is temporarily unavailable.');
+      return data;
+    }});
+  }}
+  function appendReply(text) {{
+    var bubble = document.createElement('div');
+    bubble.className = 'joy-msg joy-msg-agent';
+    bubble.style.whiteSpace = 'pre-wrap';
+    text.split(/(\\s+)/).forEach(function(part) {{
+      if (part.indexOf('https://') === 0) {{
+        try {{
+          var url = new URL(part);
+          var anchor = document.createElement('a');
+          anchor.href = url.href;
+          anchor.textContent = part;
+          anchor.target = '_blank';
+          anchor.rel = 'noopener noreferrer';
+          bubble.appendChild(anchor);
+          return;
+        }} catch (ignore) {{}}
+      }}
+      bubble.appendChild(document.createTextNode(part));
+    }});
+    container.appendChild(bubble);
+    container.scrollTop = container.scrollHeight;
+  }}
+  function ensureSession() {{
+    if (session) return Promise.resolve(session);
+    return fetch(apiBase + '/api/v1/widget/session', {{
+      method: 'POST', headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{tenant_id:tenantId}})
+    }}).then(jsonResponse).then(function(data) {{
+      session = data;
+      visitorId = data.customer_id;
+      return data;
+    }});
+  }}
+  setInterval(function() {{
+    if (!isOpen || !session) return;
+    fetch(apiBase + '/api/v1/widget/messages?tenant_id=' + encodeURIComponent(tenantId) + '&after=' + encodeURIComponent(cursor), {{
+      headers: {{Authorization: 'Bearer ' + session.token}}
+    }}).then(jsonResponse).then(function(data) {{
+      (data.messages || []).forEach(function(message) {{
+        if (!seenMessages[message.id]) {{
+          seenMessages[message.id] = true;
+          appendReply(message.text);
+        }}
+        cursor = message.created_at;
+      }});
+    }}).catch(function() {{ /* Retry next poll without inventing a reply. */ }});
+  }}, 5000);
 
   function send() {{
+    if (sendBtn.disabled) return;
     var text = input.value.trim();
     if (!text) return;
     input.value = '';
@@ -207,30 +264,27 @@ class WidgetAPIService:
     container.appendChild(userBubble);
     container.scrollTop = container.scrollHeight;
 
-    // Call API
-    fetch(apiBase + '/api/v1/widget/chat', {{
+    sendBtn.disabled = true;
+    ensureSession().then(function(currentSession) {{
+    return fetch(apiBase + '/api/v1/widget/chat', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{
         tenant_id: tenantId,
         customer_id: visitorId,
-        message: text
+        message: text,
+        visitor_token: currentSession.token,
+        request_id: crypto.randomUUID()
       }})
-    }})
-    .then(function(r) {{ return r.json(); }})
+    }}); }})
+    .then(jsonResponse)
     .then(function(data) {{
-      var agentBubble = document.createElement('div');
-      agentBubble.className = 'joy-msg joy-msg-agent';
-      var rawReply = data.reply || 'Thanks for reaching out!';
-      var safeContent = escapeHtml(rawReply).replace(/\\n/g, '<br/>');
-      safeContent = safeContent.replace(/(https?:\\\/\\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#059669;text-decoration:underline;font-weight:600;">$1</a>');
-      agentBubble.innerHTML = safeContent;
-      container.appendChild(agentBubble);
-      container.scrollTop = container.scrollHeight;
+      if (data.reply) appendReply(data.reply);
     }})
     .catch(function(err) {{
-      console.error('Joy widget error:', err);
-    }});
+      appendReply(err.message || 'Chat is temporarily unavailable. Please try again.');
+      session = null;
+    }}).finally(function() {{ sendBtn.disabled = false; }});
   }}
 
   sendBtn.onclick = send;

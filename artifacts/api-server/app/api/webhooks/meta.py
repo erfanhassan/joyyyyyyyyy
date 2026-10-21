@@ -27,6 +27,9 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
     from app.services.hitl_orchestrator import HITLOrchestrator
 
     async with AsyncSessionLocal() as db:
+        if tenant_id == "default":
+            raise RuntimeError("Durable processing requires a resolved workspace.")
+        db.info["tenant_id"] = tenant_id
         try:
             # 1. Identify Tenant and TenantIntegration
             integration = None
@@ -69,9 +72,12 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                     if integration:
                         break
 
+            from app.services.webhook_jobs import resolve_integration
+            integration = await resolve_integration(db, "meta", payload.get("entry", [{}])[0].get("id"), tenant_id)
+            tenant_uuid = integration.tenant_id
+
             if not integration or not tenant_uuid:
-                logger.warning(f"No active Meta integration found matching event {event_id}. Event cannot be automated.")
-                return
+                raise RuntimeError("No active matching Meta integration.")
 
             # 2. Decrypt Page Access Token
             page_token = None
@@ -80,7 +86,7 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                     page_token = decrypt_token(integration.access_token_encrypted)
                 except Exception as e:
                     logger.error(f"Failed to decrypt Meta access token: {e}")
-                    return
+                    raise RuntimeError("Page credentials cannot be decrypted.") from None
 
             page_settings = integration.settings or {}
             ig_account_id = str(page_settings.get("instagram_account_id", ""))
@@ -176,7 +182,9 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                         "message_text": message_text,
                         "comment_id": None,
                         "is_private_reply": False,
-                        "page_access_token": page_token,
+                        "integration_id": str(integration.id),
+                        "request_id": event_id,
+                        "conversation_id": str(conv.id),
                         "store_domain": None,
                         "agent_active": True,
                         "system_prompt": None,
@@ -205,7 +213,7 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                             conversation_id=conv.id,
                             sender_type="agent",
                             message_text=final_state["reply_text"],
-                            raw_payload=final_state,
+                            raw_payload=__import__("app.core.safety", fromlist=["redact"]).redact(final_state),
                         )
                         db.add(agent_log)
                         await db.commit()
@@ -235,7 +243,9 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
                             "message_text": comment_msg,
                             "comment_id": comment_id,
                             "is_private_reply": True,
-                            "page_access_token": page_token,
+                            "integration_id": str(integration.id),
+                            "request_id": event_id,
+                            "conversation_id": str(conv.id),
                             "store_domain": None,
                             "agent_active": True,
                             "system_prompt": None,
@@ -257,14 +267,12 @@ async def process_meta_background(payload: dict, tenant_id: str, event_id: str):
 
                         await agent.execute(initial_state)
 
-            # Mark processed in idempotency service
-            await IdempotencyService.mark_event_completed(str(tenant_uuid), event_id)
+            # Completion belongs to the durable inbox worker, not Redis.
             logger.info(f"Successfully processed Meta event {event_id} for tenant {tenant_uuid}")
 
         except Exception as e:
             logger.error(f"Error processing Meta background webhook {event_id}: {e}", exc_info=True)
-            if tenant_uuid:
-                await IdempotencyService.release_event_lock(str(tenant_uuid), event_id)
+            raise
 
 
 @router.get("")
@@ -306,6 +314,8 @@ async def receive_meta_webhook(
     Responds within 1,500ms.
     """
     raw_body = await request.body()
+    if not settings.META_APP_SECRET:
+        raise HTTPException(503, "Meta webhook verification is not configured.")
 
     # 1. HMAC Signature Verification
     if settings.META_APP_SECRET:
@@ -323,6 +333,11 @@ async def receive_meta_webhook(
     except Exception as e:
         logger.error(f"Failed to parse Meta JSON payload: {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed JSON")
+
+    if payload.get("object") == "whatsapp_business_account":
+        from app.services.whatsapp import enqueue_whatsapp
+        accepted = await enqueue_whatsapp(payload, tenant_id)
+        return {"status": "queued", "accepted_events": accepted}
 
     # 3. Extract Deduplication Event ID
     # Meta payloads typically have entry[0].id or entry[0].time or messaging[0].message.mid
@@ -347,16 +362,11 @@ async def receive_meta_webhook(
         import hashlib
         event_id = hashlib.sha256(raw_body).hexdigest()[:16]
 
-    # 4. Redis SETNX 24-Hour Deduplication
-    is_new = await IdempotencyService.check_and_set_event(tenant_id, event_id)
-    if not is_new:
-        return {"status": "duplicate_ignored", "event_id": event_id}
-
-    # 5. Dispatch to Background Worker
-    background_tasks.add_task(process_meta_background, payload, tenant_id, event_id)
+    from app.services.webhook_jobs import enqueue_meta
+    accepted = await enqueue_meta(payload, tenant_id)
 
     # 6. Immediate HTTP 200 OK
     return {
         "status": "received", "event_id": event_id, "tenant_id": tenant_id,
-        "automation_status": "setup_required",
+        "automation_status": "queued", "accepted_events": accepted,
     }

@@ -71,7 +71,10 @@ class EmbeddingService:
             # Do NOT silently fall back to deterministic vectors when API key is configured
             raise RuntimeError(f"OpenAI embedding generation failed after {max_retries} attempts: {last_err}")
 
-        # 2. Deterministic normalized embedding ONLY when no OPENAI_API_KEY is configured (e.g. offline unit testing)
+        from app.core.deployment_guard import is_public_deployment
+        if is_public_deployment():
+            raise RuntimeError("Production knowledge indexing requires an embedding provider; synthetic vectors are disabled.")
+        # Deterministic vectors are available only for offline/local tests.
         logger.info("OPENAI_API_KEY not configured. Generating deterministic embeddings for testing.")
         return [EmbeddingService._generate_deterministic_embedding(t) for t in texts]
 
