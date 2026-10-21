@@ -4,6 +4,7 @@ import httpx
 from fastapi import HTTPException
 from app.core.config import settings
 from app.core.deployment_guard import is_public_deployment
+from app.services.meta_credentials import MetaCredentialError, credential_error
 
 logger = logging.getLogger("joy.meta_api")
 GRAPH_API_VERSION = "v26.0"
@@ -34,6 +35,10 @@ class MetaAPIClient:
                     params={"fields": "id,name,instagram_business_account{id,username}"},
                 )
             if response.status_code != 200:
+                data = response.json()
+                reconnect_error = credential_error(data, "Facebook Page")
+                if reconnect_error:
+                    raise reconnect_error
                 raise HTTPException(status_code=400, detail="Meta rejected the Page credentials or permissions. Reconnect the Page.")
             data = response.json()
             if data.get("id") != page_id or not data.get("name"):
@@ -149,7 +154,8 @@ class MetaAPIClient:
     ) -> Dict[str, Any]:
         """Send direct message on Facebook Messenger."""
         return await MetaAPIClient.confirmed_post("me/messages", page_access_token, {
-            "recipient":{"id":recipient_id}, "message":{"text":message_text}, "messaging_type":"RESPONSE"})
+            "recipient":{"id":recipient_id}, "message":{"text":message_text}, "messaging_type":"RESPONSE"},
+            channel="Facebook Messenger")
 
     @staticmethod
     async def send_instagram_dm(
@@ -159,7 +165,7 @@ class MetaAPIClient:
     ) -> Dict[str, Any]:
         """Send direct message on Instagram Direct."""
         return await MetaAPIClient.confirmed_post("me/messages", page_access_token, {
-            "recipient":{"id":recipient_id}, "message":{"text":message_text}})
+            "recipient":{"id":recipient_id}, "message":{"text":message_text}}, channel="Instagram")
 
     @staticmethod
     async def reply_public_comment(
@@ -172,7 +178,9 @@ class MetaAPIClient:
         if not comment_id.replace("_", "").isdigit():
             raise RuntimeError("Invalid comment identifier.")
         suffix = "replies" if channel == "instagram" else "comments"
-        return await MetaAPIClient.confirmed_post(f"{comment_id}/{suffix}", page_access_token, {"message":message_text})
+        label = "Instagram" if channel == "instagram" else "Facebook"
+        return await MetaAPIClient.confirmed_post(f"{comment_id}/{suffix}", page_access_token,
+            {"message":message_text}, channel=label)
 
     @staticmethod
     async def send_comment_to_dm_handshake(
@@ -189,10 +197,11 @@ class MetaAPIClient:
         # Plain text private replies are supported without claiming a discount
         # or promising a button that the provider has not actually rendered.
         return await MetaAPIClient.confirmed_post("me/messages", page_access_token, {
-            "recipient":{"comment_id":comment_id}, "message":{"text":private_message_text}})
+            "recipient":{"comment_id":comment_id}, "message":{"text":private_message_text}},
+            channel="Instagram or Facebook Page")
 
     @staticmethod
-    async def confirmed_post(path, token, payload):
+    async def confirmed_post(path, token, payload, channel="Meta Page"):
         if not token or token.startswith(("joy_", "mock_", "test_")):
             raise RuntimeError("A verified Meta connection is required; no message was simulated.")
         try:
@@ -202,6 +211,11 @@ class MetaAPIClient:
             data = response.json()
         except (httpx.HTTPError, ValueError):
             raise RuntimeError("Meta delivery could not be confirmed.") from None
-        if response.status_code not in (200,201) or data.get("error") or not (data.get("id") or data.get("message_id")):
+        if response.status_code not in (200,201) or data.get("error"):
+            reconnect_error = credential_error(data, channel)
+            if reconnect_error:
+                raise reconnect_error
+            raise RuntimeError("Meta rejected the message or did not return a delivery identifier.")
+        if not (data.get("id") or data.get("message_id")):
             raise RuntimeError("Meta rejected the message or did not return a delivery identifier.")
         return data

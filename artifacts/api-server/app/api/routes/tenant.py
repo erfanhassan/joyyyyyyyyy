@@ -11,6 +11,7 @@ from app.db.models import Tenant, TenantIntegration, Order, User
 from app.core.security import encrypt_token, decrypt_token
 from app.core.config import settings
 from app.services.telephony_service import TelephonyService, OutboundCallingUnavailable
+from app.services.meta_credentials import MetaCredentialError, mark_reconnect_required
 import httpx
 import time
 
@@ -478,9 +479,12 @@ async def meta_select_page(
 
     if not payload.page_id.isdigit() or not payload.page_access_token:
         raise HTTPException(status_code=400, detail="A real Facebook Page ID and Page access token are required.")
-    page_identity = await MetaAPIClient.get_page_identity(
-        payload.page_id, payload.page_access_token,
-    )
+    try:
+        page_identity = await MetaAPIClient.get_page_identity(
+            payload.page_id, payload.page_access_token,
+        )
+    except MetaCredentialError as error:
+        raise HTTPException(400, str(error)) from None
     instagram = page_identity.get("instagram_business_account") or {}
     if payload.instagram_account_id and str(instagram.get("id", "")) != payload.instagram_account_id:
         raise HTTPException(400, "The selected Instagram account is not linked to this verified Page.")
@@ -680,6 +684,17 @@ async def test_integration_connection(
         try:
             identity = await MetaAPIClient.get_page_identity(page_id, raw_token)
             page_name = identity["name"]
+        except MetaCredentialError as exc:
+            mark_reconnect_required(integration, exc.channel)
+            await db.commit()
+            return {
+                "status": "needs_reconnect",
+                "provider": "meta",
+                "connected": False,
+                "needs_reconnect": True,
+                "attention_channel": exc.channel,
+                "message": str(exc),
+            }
         except HTTPException as exc:
             return {"status": "error", "provider": "meta", "connected": False, "message": exc.detail}
         latency = max(1, int((time.monotonic() - t0) * 1000))

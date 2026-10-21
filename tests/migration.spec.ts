@@ -1,13 +1,11 @@
 import { test, expect } from '@playwright/test';
 
-const tenant = 'a1e6f58d-b575-420e-b4d6-1fef0064e746';
-
 test('original pages, navigation, and live operator connection', async ({ page, request }) => {
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   expect((await request.get('/api/healthz')).ok()).toBeTruthy();
   await page.goto('/');
-  await expect(page.getByRole('heading', { level: 1 })).toContainText('Hire AI staff');
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('Manage social sales');
   await expect(page.getByText('Connected (Healthy)')).toBeVisible();
   await page.getByRole('link', { name: /Launch Dashboard/ }).click();
   await expect(page).toHaveURL(/\/dashboard\/integration-hub$/);
@@ -26,6 +24,9 @@ test('original pages, navigation, and live operator connection', async ({ page, 
 });
 
 test('employee guardrails save and survive a reload', async ({ page, request }) => {
+  const workspace = await request.get('/api/v1/tenant/me');
+  expect(workspace.ok()).toBeTruthy();
+  const { id: tenant } = await workspace.json();
   const url = `/api/v1/tenant/${tenant}/agents`;
   const response = await request.get(url);
   expect(response.ok()).toBeTruthy();

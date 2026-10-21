@@ -19,6 +19,8 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
   const [phone, setPhone] = useState("");
   const [token, setToken] = useState("");
   const [connected, setConnected] = useState(false);
+  const [needsReconnect, setNeedsReconnect] = useState(false);
+  const [attentionChannel, setAttentionChannel] = useState("WhatsApp");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [signupAvailable, setSignupAvailable] = useState(false);
@@ -33,6 +35,8 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
     const data = await response.json();
     const record = data.integrations.find((item: {provider: string}) => item.provider === "whatsapp");
     setConnected(Boolean(record?.is_active));
+    setNeedsReconnect(record?.settings?.connection_status === "needs_reconnect");
+    setAttentionChannel(record?.settings?.attention_channel || "WhatsApp");
     if (record) {
       setWaba(record.settings.waba_id || "");
       setPhone(record.settings.phone_number_id || "");
@@ -164,7 +168,26 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
       Connect an official Cloud API number. Meta Embedded Signup can securely authorize and return the business account and phone number.
       JOY supports customer-initiated text replies within Meta’s 24-hour window; template messages and campaigns are not enabled.
     </p>
-    <p className="mb-3 text-sm">{connected ? "Connected — account ownership and WABA subscription verified; live delivery still needs testing" : "Not connected"}</p>
+    <p className="mb-3 text-sm">{needsReconnect
+      ? "Reconnect required — WhatsApp replies are paused"
+      : connected
+        ? "Connected — account ownership and WABA subscription verified; live delivery still needs testing"
+        : "Not connected"}</p>
+    {needsReconnect && <div role="alert" className="mb-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+      <p className="font-semibold">{attentionChannel} needs reconnection</p>
+      <p className="mt-1">Replies are paused until WhatsApp is reauthorized. Existing delivery records are preserved.</p>
+      <button type="button" onClick={() => {
+        if (signupAvailable) {
+          void connectWithEmbeddedSignup();
+        } else {
+          setNotice("One-click signup is unavailable. Enter refreshed credentials in Manual setup below.");
+          document.getElementById("whatsapp-manual-token")?.focus();
+        }
+      }} disabled={busy}
+        className="mt-2 rounded-md border border-amber-500 px-3 py-1.5 font-semibold disabled:opacity-50">
+        Reconnect WhatsApp
+      </button>
+    </div>}
     {notice && <p role="status" className="mb-3 text-sm">{notice}</p>}
     <div className="mb-4 rounded-lg border p-3">
       <button
@@ -173,7 +196,7 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
         onClick={connectWithEmbeddedSignup}
         className="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground disabled:opacity-50"
       >
-        {busy ? "Connecting…" : "Connect with Meta (recommended)"}
+        {busy ? "Connecting…" : needsReconnect ? "Reconnect with Meta (recommended)" : "Connect with Meta (recommended)"}
       </button>
       {!signupAvailable && (
         <p className="mt-2 text-xs text-muted-foreground">
@@ -207,7 +230,7 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
           className="mt-1 w-full rounded-md border bg-background p-2" />
       </label>
       <label className="text-sm">System-user access token
-        <input required type="password" autoComplete="off" value={token} onChange={e=>setToken(e.target.value)}
+        <input id="whatsapp-manual-token" required type="password" autoComplete="off" value={token} onChange={e=>setToken(e.target.value)}
           className="mt-1 w-full rounded-md border bg-background p-2" />
       </label>
       <button disabled={busy} className="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground disabled:opacity-50">

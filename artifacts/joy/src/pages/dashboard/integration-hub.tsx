@@ -545,9 +545,15 @@ export default function IntegrationHubPage() {
                 <Share2 className="w-5 h-5 text-foreground" />
               </div>
               {metaInt ? (
-                <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
-                  Page authorized
+                <span className={`text-xs font-semibold px-2.5 py-1 rounded-full border flex items-center gap-1.5 ${
+                  metaInt.settings.connection_status === "needs_reconnect"
+                    ? "bg-amber-50 text-amber-800 border-amber-200"
+                    : "bg-brand-50 text-brand-700 border-brand-100"
+                }`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${
+                    metaInt.settings.connection_status === "needs_reconnect" ? "bg-amber-600" : "bg-brand-600 animate-pulse"
+                  }`} />
+                  {metaInt.settings.connection_status === "needs_reconnect" ? "Reconnect required" : "Page authorized"}
                 </span>
               ) : (
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-surface text-muted border border-border">
@@ -565,6 +571,21 @@ export default function IntegrationHubPage() {
 
             {metaInt ? (
               <div className="space-y-2 bg-surface p-3.5 rounded-lg border border-border text-xs">
+                {metaInt.settings.connection_status === "needs_reconnect" && (
+                  <div role="alert" className="rounded-md border border-amber-300 bg-amber-50 p-3 text-amber-900">
+                    <p className="font-semibold">
+                      {metaInt.settings.attention_channel || "Meta Page"} needs reconnection
+                    </p>
+                    <p className="mt-1">Replies are paused until the account is reauthorized. Existing delivery records are preserved.</p>
+                    <button
+                      type="button"
+                      onClick={() => setMetaModalOpen(true)}
+                      className="mt-2 rounded-md border border-amber-500 px-3 py-1.5 font-semibold hover:bg-amber-100"
+                    >
+                      Reconnect Meta
+                    </button>
+                  </div>
+                )}
                 <div className="flex items-center justify-between text-muted">
                   <span>Page:</span>
                   <span className="font-semibold text-foreground">{metaInt.settings.page_name || "Official Page"}</span>

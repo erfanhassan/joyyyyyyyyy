@@ -391,6 +391,7 @@ class SocialSalesAgent:
                 await self.db.commit()
             return {"dispatch_status": "paused_before_dispatch", "reply_text": "", "is_paused_for_human": True}
         page_token = None
+        integration = None
         if channel in ("facebook", "instagram"):
             integration = (await self.db.execute(select(TenantIntegration).where(
                 TenantIntegration.id == UUID(state["integration_id"]),
@@ -399,6 +400,10 @@ class SocialSalesAgent:
                 TenantIntegration.is_active.is_(True)))).scalar_one_or_none()
             if not integration:
                 raise RuntimeError("The channel integration is disconnected.")
+            if (integration.settings or {}).get("connection_status") == "needs_reconnect":
+                receipt.status = "needs_review"
+                await self.db.commit()
+                raise ManualReviewRequired("Meta needs reconnection before another reply can be sent.")
             page_token = decrypt_token(integration.access_token_encrypted)
 
         dispatch_res = {}
@@ -436,6 +441,9 @@ class SocialSalesAgent:
                     )
         except Exception as e:
             logger.error("Channel delivery failed (%s)", type(e).__name__)
+            from app.services.meta_credentials import MetaCredentialError, mark_reconnect_required
+            if isinstance(e, MetaCredentialError) and integration:
+                mark_reconnect_required(integration, e.channel)
             if receipt:
                 receipt.status = "needs_review"
                 await self.db.commit()

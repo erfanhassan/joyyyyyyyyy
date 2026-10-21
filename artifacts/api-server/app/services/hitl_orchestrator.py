@@ -303,6 +303,7 @@ class HITLOrchestrator:
         from app.core.security import decrypt_token
 
         page_token = None
+        meta_int = None
         try:
             int_stmt = select(TenantIntegration).where(
                 TenantIntegration.tenant_id == tenant_id,
@@ -340,6 +341,9 @@ class HITLOrchestrator:
             except Exception as e:
                 dispatch_status = "failed_provider"
                 dispatch_error = str(e)
+                from app.services.meta_credentials import MetaCredentialError, mark_reconnect_required
+                if isinstance(e, MetaCredentialError) and meta_int:
+                    mark_reconnect_required(meta_int, e.channel)
                 logger.error(f"External channel dispatch error: {e}")
         elif conv.channel == "whatsapp":
             try:

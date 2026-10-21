@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.core.security import decrypt_token
 from app.db.models import Conversation, InteractionLog, TenantIntegration
 from app.db.session import AsyncSessionLocal
+from app.services.meta_credentials import MetaCredentialError, credential_error, mark_reconnect_required
 
 
 class WhatsAppService:
@@ -18,6 +19,9 @@ class WhatsAppService:
                 headers={"Authorization": f"Bearer {token}"}, **kwargs)
             data = result.json()
             if result.status_code >= 300 or data.get("error"):
+                reconnect_error = credential_error(data, "WhatsApp")
+                if reconnect_error:
+                    raise reconnect_error
                 raise RuntimeError("WhatsApp rejected the operation. Check number ownership, app permissions and token expiry.")
             return data
 
@@ -46,6 +50,9 @@ class WhatsAppService:
             TenantIntegration.is_active.is_(True)))).scalar_one_or_none()
         if not record or (integration_id and str(record.id) != integration_id):
             raise RuntimeError("WhatsApp is disconnected.")
+        if (record.settings or {}).get("connection_status") == "needs_reconnect":
+            from app.services.webhook_jobs import ManualReviewRequired
+            raise ManualReviewRequired("WhatsApp needs reconnection before another reply can be sent.")
         incoming = (await db.execute(select(InteractionLog).where(
             InteractionLog.conversation_id == conversation.id,
             InteractionLog.tenant_id == conversation.tenant_id,
@@ -54,11 +61,15 @@ class WhatsAppService:
         timestamp = (incoming.raw_payload or {}).get("provider_timestamp") if incoming else None
         if not timestamp or time.time() - float(timestamp) >= 86400:
             raise RuntimeError("The WhatsApp reply window has closed. An approved message template and opt-in are required.")
-        result = await WhatsAppService.api(decrypt_token(record.access_token_encrypted), "POST",
-            f"{record.settings['phone_number_id']}/messages", json={
-                "messaging_product": "whatsapp", "recipient_type": "individual",
-                "to": conversation.customer_identifier, "type": "text",
-                "text": {"preview_url": False, "body": text[:4096]}})
+        try:
+            result = await WhatsAppService.api(decrypt_token(record.access_token_encrypted), "POST",
+                f"{record.settings['phone_number_id']}/messages", json={
+                    "messaging_product": "whatsapp", "recipient_type": "individual",
+                    "to": conversation.customer_identifier, "type": "text",
+                    "text": {"preview_url": False, "body": text[:4096]}})
+        except MetaCredentialError as error:
+            mark_reconnect_required(record, error.channel)
+            raise
         if not result.get("messages", [{}])[0].get("id"):
             raise RuntimeError("WhatsApp did not confirm message acceptance.")
         return result
