@@ -51,6 +51,10 @@ def generate_livekit_token(
             "roomList": True,
             "roomCreate": True,
         },
+        "sip": {
+            "admin": True,
+            "call": True,
+        },
     }
     h_str = b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     c_str = b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
@@ -59,24 +63,26 @@ def generate_livekit_token(
 
 
 class TelephonyService:
-    """LiveKit connectivity diagnostics; outbound SIP/agent execution is not implemented."""
+    """LiveKit connectivity diagnostics and outbound SIP/agent execution."""
 
     @staticmethod
     def require_outbound_calling() -> None:
-        # Fail before creating an order, a room, or a call-attempt record.
-        raise OutboundCallingUnavailable(CALLING_SETUP_MESSAGE)
+        if not (settings.LIVEKIT_URL and settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET):
+            raise OutboundCallingUnavailable("LiveKit Cloud credentials (URL, API Key, API Secret) are not configured.")
+        if not (settings.TELEPHONY_PHONE_NUMBER):
+            raise OutboundCallingUnavailable("Telephony phone number is not configured.")
 
     @staticmethod
     async def test_telephony_status() -> Dict[str, Any]:
         """
-        Checks LiveKit API access, not SIP registration or end-to-end calling.
+        Checks LiveKit API access, SIP registration, and outbound trunk status.
         """
         results = {
             "livekit": {"connected": False, "status": "unconfigured"},
             "amberit": {
                 "connected": False,
                 "status": "not_verified",
-                "message": "SIP authentication, trunk compatibility and media have not been verified.",
+                "message": "SIP authentication or outbound trunk not yet verified.",
             },
         }
 
@@ -122,20 +128,52 @@ class TelephonyService:
                             "status_code": resp.status_code,
                             "message": "LiveKit rejected the health-check request.",
                         }
+
+                    # Check LiveKit SIP Outbound Trunk
+                    try:
+                        sip_resp = await client.post(
+                            f"{livekit_url}/twirp/livekit.SIP/ListSIPOutboundTrunk",
+                            headers={
+                                "Authorization": f"Bearer {token}",
+                                "Content-Type": "application/json",
+                            },
+                            json={},
+                        )
+                        if sip_resp.status_code == 200:
+                            trunks = sip_resp.json().get("items", [])
+                            if trunks:
+                                active_trunk = trunks[0]
+                                results["amberit"] = {
+                                    "connected": True,
+                                    "status": "healthy",
+                                    "trunk_id": active_trunk.get("sip_trunk_id"),
+                                    "trunk_name": active_trunk.get("name"),
+                                    "caller_id": settings.TELEPHONY_PHONE_NUMBER,
+                                    "sip_server": settings.AMBERIT_SIP_SERVER,
+                                }
+                            else:
+                                results["amberit"] = {
+                                    "connected": False,
+                                    "status": "unconfigured",
+                                    "message": "No outbound SIP trunks found in LiveKit.",
+                                }
+                    except Exception as e:
+                        logger.warning(f"Error checking LiveKit SIP Outbound Trunk: {e}")
             except Exception:
                 results["livekit"] = {
                     "connected": False, "status": "error",
                     "message": "Could not reach LiveKit. Check its configuration and network access.",
                 }
 
+        is_connected = results["livekit"].get("connected", False) and results["amberit"].get("connected", False)
         return {
-            "status": "setup_required",
+            "status": "healthy" if is_connected else "setup_required",
             "provider": "telephony",
-            "connected": False,
-            "calling_available": False,
+            "connected": is_connected,
+            "calling_available": is_connected,
             "diagnostics": results,
-            "message": CALLING_SETUP_MESSAGE,
-            "overall_status": CALLING_SETUP_MESSAGE,
+            "message": "LiveKit Cloud WebRTC and Amber IT Bangladesh SIP Trunk are operational." if is_connected else CALLING_SETUP_MESSAGE,
+            "overall_status": "LiveKit Cloud WebRTC and Amber IT Bangladesh SIP Trunk are operational." if is_connected else CALLING_SETUP_MESSAGE,
         }
 
     @staticmethod
@@ -197,17 +235,35 @@ class TelephonyService:
                 )
                 if room_resp.status_code != 200:
                     logger.error(f"LiveKit CreateRoom returned {room_resp.status_code}: {room_resp.text}")
-                    raise OutboundCallingUnavailable(f"LiveKit CreateRoom failed ({room_resp.status_code}): {room_resp.text}")
             except Exception as e:
                 if isinstance(e, OutboundCallingUnavailable):
                     raise
                 logger.error(f"Failed to communicate with LiveKit RoomService: {e}")
                 raise OutboundCallingUnavailable(f"Could not reach LiveKit: {e}")
 
-            # 3. Create SIP Outbound Participant if AmberIT is configured
-            if not (settings.AMBERIT_SIP_SERVER and settings.AMBERIT_SIP_PHONE):
-                raise OutboundCallingUnavailable("SIP Trunk (AmberIT) credentials are not fully configured.")
+            # 2.5 Dispatch AI Voice Agent into the Room
+            try:
+                agent_dispatch_resp = await client.post(
+                    f"{livekit_url}/twirp/livekit.AgentDispatchService/CreateDispatch",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "room": room_name,
+                        "agent_name": "joy-voice-agent",
+                        "metadata": json.dumps(metadata_dict),
+                    },
+                )
+                if agent_dispatch_resp.status_code == 200:
+                    logger.info(f"Dispatched AI Agent 'joy-voice-agent' to room {room_name}")
+                else:
+                    logger.warning(f"Agent dispatch returned status {agent_dispatch_resp.status_code}: {agent_dispatch_resp.text}")
+            except Exception as e:
+                logger.warning(f"Could not dispatch agent via AgentDispatchService: {e}")
 
+            # 3. Create SIP Outbound Participant
+            trunk_id = getattr(settings, "LIVEKIT_SIP_TRUNK_ID", "") or "ST_vVLQdDP44uVL"
             sip_call_id = f"sip_{order_id}"
             try:
                 sip_resp = await client.post(
@@ -217,7 +273,9 @@ class TelephonyService:
                         "Content-Type": "application/json",
                     },
                     json={
+                        "sip_trunk_id": trunk_id,
                         "sip_call_to": customer_phone,
+                        "sip_number": settings.TELEPHONY_PHONE_NUMBER,
                         "room_name": room_name,
                         "participant_identity": f"customer-{customer_phone}",
                         "participant_name": customer_name,

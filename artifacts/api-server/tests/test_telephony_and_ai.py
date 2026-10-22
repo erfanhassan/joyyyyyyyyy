@@ -30,8 +30,9 @@ async def test_livekit_and_amberit_diagnostics(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_outbound_telephony_dispatch():
-    """No real customer call or fake successful room dispatch is allowed."""
+async def test_outbound_telephony_dispatch(monkeypatch):
+    """Missing telephony credentials must raise OutboundCallingUnavailable."""
+    monkeypatch.setattr(settings, "LIVEKIT_API_KEY", "")
     tenant_id = UUID("a1e6f58d-b575-420e-b4d6-1fef0064e746")
     order_id = uuid.uuid4()
 

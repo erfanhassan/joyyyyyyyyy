@@ -279,12 +279,12 @@ export default function EmployeeRosterPage() {
                     }`}
                   >
                     <span className={`w-1.5 h-1.5 rounded-full ${emp.is_active ? "bg-brand-600 animate-pulse" : "bg-muted"}`} />
-                    <span>{emp.agent_type !== "social_sales" ? "Unavailable — setup required" : emp.is_active ? "Active On Duty" : "Paused"}</span>
+                    <span>{emp.is_active ? "Active On Duty" : "Paused"}</span>
                   </button>
 
                   <button
                     onClick={() => handleSaveGuardrails(emp)}
-                    disabled={isSaving || emp.agent_type !== "social_sales"}
+                    disabled={isSaving}
                     className="px-3.5 py-1.5 bg-foreground hover:bg-foreground/90 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shadow-sm"
                   >
                     <Save className="w-3.5 h-3.5" />

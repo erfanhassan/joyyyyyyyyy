@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     MAX_CRAWL_BYTES: int = 2 * 1024 * 1024
     MAX_DOCUMENT_CHUNKS: int = 500
     SHOPIFY_API_VERSION: str = "2026-07"
+    DOMAIN: str = "joy.sonictch.com"
+    CUSTOM_DOMAINS: str = "joy.sonictch.com"
+    REPLIT_DOMAINS: str = "joy.sonictch.com,localhost,127.0.0.1"
     
     # CORS Origins
     BACKEND_CORS_ORIGINS: List[str] = [
@@ -47,6 +50,7 @@ class Settings(BaseSettings):
     LIVEKIT_LLM_MODEL: str = "deepseek-ai/deepseek-v3"
     LIVEKIT_TTS_MODEL: str = "openai/tts-1"
     OPENAI_VOICE: str = "alloy"
+    LIVEKIT_SIP_TRUNK_ID: str = "ST_vVLQdDP44uVL"
     SIP_TRUNK_PROVIDER: str = "AmberIT"
     AMBERIT_SIP_SERVER: str = ""
     AMBERIT_EXTENSION: str = ""
@@ -55,6 +59,19 @@ class Settings(BaseSettings):
     AMBERIT_SIP_PHONE: str = ""
     AMBERIT_SWITCH_URI: str = ""
     AMBERIT_GATEWAY_URI: str = ""
+
+    # Courier Delivery Partners (Bangladesh: Steadfast & Pathao)
+    STEADFAST_API_KEY: str = ""
+    STEADFAST_SECRET_KEY: str = ""
+    STEADFAST_BASE_URL: str = "https://portal.steadfast.com.bd/api/v1"
+    PATHAO_CLIENT_ID: str = ""
+    PATHAO_CLIENT_SECRET: str = ""
+    PATHAO_USERNAME: str = ""
+    PATHAO_PASSWORD: str = ""
+    PATHAO_BASE_URL: str = "https://api-hermes.pathao.com"
+
+    # Google Sheets Integration
+    GOOGLE_SERVICE_ACCOUNT_JSON: str = ""
 
     # Social Channels (Meta Graph API)
     META_APP_ID: str = ""

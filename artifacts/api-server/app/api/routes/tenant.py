@@ -648,12 +648,20 @@ async def test_integration_connection(
     if provider in ("telephony", "amberit", "livekit"):
         return await TelephonyService.test_telephony_status()
 
-    stmt = select(TenantIntegration).where(
-        TenantIntegration.tenant_id == tenant_id,
-        TenantIntegration.provider == provider,
-    )
-    res = await db.execute(stmt)
-    integration = res.scalar_one_or_none()
+    if provider in ("courier", "steadfast", "pathao"):
+        stmt = select(TenantIntegration).where(
+            TenantIntegration.tenant_id == tenant_id,
+            TenantIntegration.provider.in_(["steadfast", "pathao", "courier"]),
+        )
+        res = await db.execute(stmt)
+        integration = res.scalars().first()
+    else:
+        stmt = select(TenantIntegration).where(
+            TenantIntegration.tenant_id == tenant_id,
+            TenantIntegration.provider == provider,
+        )
+        res = await db.execute(stmt)
+        integration = res.scalar_one_or_none()
 
     if not integration or not integration.is_active:
         return {
@@ -726,6 +734,49 @@ async def test_integration_connection(
             "webhook_endpoint": f"/api/v1/webhooks/woocommerce/{tenant_id}",
             "message": "WooCommerce credentials are stored. Live API access and webhook delivery have not been verified.",
         }
+    elif provider == "google_sheets":
+        from app.services.google_sheets_service import GoogleSheetsService
+        sheet_url = integration.settings.get("sheet_url")
+        webhook_url = integration.settings.get("webhook_url")
+        try:
+            orders = []
+            method = "Apps Script Webhook" if webhook_url else "Direct CSV Reader"
+            if webhook_url:
+                orders = await GoogleSheetsService.fetch_orders_via_apps_script(webhook_url)
+            elif sheet_url:
+                sheet_id = GoogleSheetsService.extract_sheet_id_from_url(sheet_url)
+                orders = await GoogleSheetsService.fetch_orders_from_csv_export(sheet_id)
+
+            pending = [o for o in orders if str(o.get("status", "")).lower() in ("pending", "pending_confirmation", "unconfirmed", "")]
+            is_ok = len(orders) > 0 or bool(sheet_url or webhook_url)
+            return {
+                "status": "healthy" if is_ok else "unconfigured",
+                "provider": "google_sheets",
+                "connected": is_ok,
+                "sync_method": method,
+                "total_orders": len(orders),
+                "pending_orders": len(pending),
+                "message": f"Verified Google Sheet ({method})! Found {len(orders)} total orders, {len(pending)} pending phone confirmation.",
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "provider": "google_sheets",
+                "connected": False,
+                "message": f"Could not read Google Sheet: {e}",
+            }
+    elif provider in ("steadfast", "pathao", "courier"):
+        from app.services.courier_service import CourierService
+        actual_provider = integration.settings.get("provider", provider if provider != "courier" else "steadfast")
+        verification = await CourierService.verify_credentials(actual_provider, integration.settings)
+        return {
+            "status": "healthy" if verification.get("connected") else "error",
+            "provider": actual_provider,
+            "connected": verification.get("connected", False),
+            "balance": verification.get("balance"),
+            "message": verification.get("message"),
+            "details": verification,
+        }
     else:
         return {
             "status": "not_verified",
@@ -754,6 +805,42 @@ async def get_telephony_status(tenant_id: UUID):
     return await TelephonyService.test_telephony_status()
 
 
+class GoogleSheetSyncRequest(BaseModel):
+    sheet_url: Optional[str] = None
+    webhook_url: Optional[str] = None
+    bypass_hours: bool = False
+
+
+class GoogleSheetConfigRequest(BaseModel):
+    sheet_url: Optional[str] = None
+    webhook_url: Optional[str] = None
+    tab_name: str = "Orders"
+
+
+class CourierConfigRequest(BaseModel):
+    provider: str = Field(default="steadfast", description="'steadfast' or 'pathao'")
+    api_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    store_id: Optional[int] = None
+
+
+class CallingSubscriptionRequest(BaseModel):
+    enabled: bool = True
+    plan: str = "growth"
+
+
+@router.get("/{tenant_id}/telephony/status")
+async def get_telephony_status(tenant_id: UUID):
+    """
+    Returns real-time health and diagnostics for LiveKit Cloud WebRTC and Amber IT Bangladesh PABX.
+    """
+    return await TelephonyService.test_telephony_status()
+
+
 @router.post("/{tenant_id}/telephony/test-call")
 async def trigger_test_call(
     tenant_id: UUID,
@@ -768,6 +855,12 @@ async def trigger_test_call(
         TelephonyService.require_outbound_calling()
     except OutboundCallingUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
+
+    # Fetch store name for tenant
+    t_stmt = select(Tenant).where(Tenant.id == tenant_id)
+    t_res = await db.execute(t_stmt)
+    tenant_obj = t_res.scalars().first()
+    store_name = tenant_obj.name if tenant_obj else "JOY Store"
 
     order_id = uuid.uuid4()
     order = Order(
@@ -795,6 +888,7 @@ async def trigger_test_call(
         order_items=payload.order_items,
         order_total=payload.order_total,
         tenant_id=tenant_id,
+        merchant_name=store_name,
     )
 
     return {
@@ -802,6 +896,195 @@ async def trigger_test_call(
         "order_id": str(order_id),
         "external_order_id": order.external_order_id,
         "dispatch": call_dispatch,
-        "message": f"Voice confirmation call dispatched via Amber IT (+8809611901539) to {payload.customer_phone}",
+        "message": f"Voice confirmation call dispatched via Amber IT ({settings.TELEPHONY_PHONE_NUMBER}) to {payload.customer_phone}",
+    }
+
+
+@router.post("/{tenant_id}/telephony/google-sheets/sync")
+async def sync_google_sheets(
+    tenant_id: UUID,
+    payload: GoogleSheetSyncRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Polls connected Google Sheet for pending confirmation orders and triggers the voice confirmation call loop.
+    """
+    from app.services.google_sheets_service import GoogleSheetsService
+
+    # Check if tenant has stored Google Sheets integration
+    int_stmt = select(TenantIntegration).where(
+        TenantIntegration.tenant_id == tenant_id,
+        TenantIntegration.provider == "google_sheets",
+        TenantIntegration.is_active == True,
+    )
+    int_res = await db.execute(int_stmt)
+    sheet_int = int_res.scalars().first()
+
+    config = {}
+    if sheet_int and sheet_int.settings:
+        config.update(sheet_int.settings)
+    if payload.sheet_url:
+        config["sheet_url"] = payload.sheet_url
+    if payload.webhook_url:
+        config["webhook_url"] = payload.webhook_url
+    config["bypass_hours"] = payload.bypass_hours
+
+    if not config.get("sheet_url") and not config.get("webhook_url"):
+        raise HTTPException(400, "Please provide a Google Sheet URL or Apps Script Webhook URL.")
+
+    result = await GoogleSheetsService.sync_and_dispatch_pending_orders(
+        tenant_id=tenant_id,
+        sheet_config=config,
+        db_session=db,
+    )
+    return result
+
+
+@router.post("/{tenant_id}/integrations/google-sheets")
+async def save_google_sheets_integration(
+    tenant_id: UUID,
+    payload: GoogleSheetConfigRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Saves or updates merchant Google Sheet connection details.
+    """
+    stmt = select(TenantIntegration).where(
+        TenantIntegration.tenant_id == tenant_id,
+        TenantIntegration.provider == "google_sheets",
+    )
+    res = await db.execute(stmt)
+    existing = res.scalars().first()
+
+    sheet_settings = {
+        "sheet_url": payload.sheet_url or "",
+        "webhook_url": payload.webhook_url or "",
+        "tab_name": payload.tab_name or "Orders",
+    }
+    from app.core.safety import seal_credentials
+    safe_settings = seal_credentials(sheet_settings)
+
+    if existing:
+        existing.settings = safe_settings
+        existing.is_active = True
+        db.add(existing)
+    else:
+        new_int = TenantIntegration(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            provider="google_sheets",
+            access_token_encrypted=encrypt_token("google_sheets_active"),
+            settings=safe_settings,
+            is_active=True,
+        )
+        db.add(new_int)
+
+    await db.commit()
+    return {
+        "status": "success",
+        "message": "Google Sheets integration configured successfully.",
+        "settings": safe_settings,
+    }
+
+
+@router.post("/{tenant_id}/integrations/courier")
+async def save_courier_integration(
+    tenant_id: UUID,
+    payload: CourierConfigRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Saves or updates delivery partner credentials (Steadfast Courier or Pathao Parcel).
+    """
+    provider_key = payload.provider.lower()
+    if provider_key not in ("steadfast", "pathao"):
+        raise HTTPException(400, "Supported courier providers are 'steadfast' and 'pathao'.")
+
+    stmt = select(TenantIntegration).where(
+        TenantIntegration.tenant_id == tenant_id,
+        TenantIntegration.provider == provider_key,
+    )
+    res = await db.execute(stmt)
+    existing = res.scalars().first()
+
+    courier_settings = {
+        "provider": provider_key,
+        "api_key": payload.api_key or "",
+        "secret_key": payload.secret_key or "",
+        "client_id": payload.client_id or "",
+        "client_secret": payload.client_secret or "",
+        "username": payload.username or "",
+        "password": payload.password or "",
+        "store_id": payload.store_id or 1,
+    }
+    from app.core.safety import seal_credentials
+    safe_settings = seal_credentials(courier_settings)
+
+    token_to_encrypt = payload.api_key or payload.client_id or "courier_active"
+    if existing:
+        existing.settings = safe_settings
+        existing.access_token_encrypted = encrypt_token(token_to_encrypt)
+        existing.is_active = True
+        db.add(existing)
+    else:
+        new_int = TenantIntegration(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            provider=provider_key,
+            access_token_encrypted=encrypt_token(token_to_encrypt),
+            settings=safe_settings,
+            is_active=True,
+        )
+        db.add(new_int)
+
+    await db.commit()
+    return {
+        "status": "success",
+        "message": f"{provider_key.capitalize()} delivery partner integration saved.",
+        "provider": provider_key,
+    }
+
+
+@router.post("/{tenant_id}/telephony/subscription")
+async def update_calling_subscription(
+    tenant_id: UUID,
+    payload: CallingSubscriptionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Activates or updates the calling agent subscription for the tenant.
+    """
+    cfg_stmt = select(AgentConfig).where(
+        AgentConfig.tenant_id == tenant_id,
+        AgentConfig.agent_type == "voice_confirmation",
+    )
+    cfg_res = await db.execute(cfg_stmt)
+    agent_cfg = cfg_res.scalars().first()
+
+    if agent_cfg:
+        agent_cfg.is_active = payload.enabled
+        db.add(agent_cfg)
+    else:
+        # Create voice agent config if not present
+        new_cfg = AgentConfig(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            agent_type="voice_confirmation",
+            name="Employee #2: Voice Confirmation Specialist",
+            system_prompt=(
+                "You are JOY Voice Confirmation Specialist. Call customers politely to confirm their "
+                "order items, shipping address, and total amount. Speak naturally in Bangla or English."
+            ),
+            is_active=payload.enabled,
+        )
+        db.add(new_cfg)
+
+    await db.commit()
+    return {
+        "status": "success",
+        "subscription_active": payload.enabled,
+        "plan": payload.plan,
+        "caller_id": settings.TELEPHONY_PHONE_NUMBER,
+        "message": "Calling agent subscription updated successfully.",
     }
 

@@ -9,6 +9,7 @@
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
     "dev:api": "pnpm --filter @workspace/api-server run dev",
     "dev:web": "pnpm --filter @workspace/joy run dev",
+    "dev:voice": "PYTHONPATH=artifacts/api-server uv run python artifacts/api-server/app/agents/livekit_voice_worker.py dev",
     "dev": "pnpm --parallel --filter @workspace/api-server --filter @workspace/joy run dev"
   },
   "private": true,

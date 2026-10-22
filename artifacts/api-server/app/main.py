@@ -38,14 +38,47 @@ async def lifespan(app: FastAPI):
     # Schema is managed separately: Alembic in development, Publish in production.
     # Never run schema-changing statements while the application starts.
     import asyncio
+    import sys
+    import os
     from app.services.webhook_jobs import worker
     task = asyncio.create_task(worker(), name="durable-webhook-worker")
+
+    # Auto-start LiveKit Voice Agent Worker process if credentials configured
+    voice_worker_proc = None
+    if settings.LIVEKIT_URL and settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET:
+        try:
+            worker_script = os.path.join(os.path.dirname(__file__), "agents", "livekit_voice_worker.py")
+            if os.path.exists(worker_script):
+                env = os.environ.copy()
+                env["PYTHONPATH"] = os.path.dirname(os.path.dirname(__file__))
+                voice_worker_proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    worker_script,
+                    "start",
+                    env=env,
+                )
+                logger.info("Auto-started LiveKit voice confirmation worker process.")
+        except Exception as e:
+            logger.warning(f"Could not auto-start LiveKit voice worker: {e}")
+
     yield
+
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
+
+    if voice_worker_proc and voice_worker_proc.returncode is None:
+        try:
+            voice_worker_proc.terminate()
+            await asyncio.wait_for(voice_worker_proc.wait(), timeout=3.0)
+        except Exception:
+            try:
+                voice_worker_proc.kill()
+            except Exception:
+                pass
+
     await async_engine.dispose()
 
 

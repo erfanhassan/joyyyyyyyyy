@@ -26,6 +26,39 @@ class TelephonyCompletionPayload(BaseModel):
     updated_shipping_address: Optional[str] = None
 
 
+@router.post("/livekit")
+async def handle_livekit_cloud_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Native LiveKit Cloud Webhook Receiver:
+    Validates Authorization header signed by LiveKit Cloud using livekit.api.WebhookReceiver.
+    Handles events:
+    - participant_joined
+    - participant_left
+    - room_finished
+    """
+    from livekit.api import WebhookReceiver
+    from app.core.config import settings
+
+    auth_header = request.headers.get("Authorization", "")
+    body_bytes = await request.body()
+    body_str = body_bytes.decode("utf-8")
+
+    receiver = WebhookReceiver(settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET)
+    try:
+        event = receiver.receive(body_str, auth_header)
+    except Exception as e:
+        logger.warning(f"LiveKit Cloud webhook signature rejected: {e}")
+        raise HTTPException(401, f"Invalid LiveKit webhook token: {e}")
+
+    event_name = getattr(event, "event", "unknown")
+    room_name = getattr(getattr(event, "room", None), "name", "")
+    logger.info(f"LiveKit Cloud Webhook Event received: {event_name} for room '{room_name}'")
+    return {"status": "received", "event": event_name, "room": room_name}
+
+
 @router.post("/completion")
 async def handle_telephony_completion(
     payload: TelephonyCompletionPayload,
@@ -120,7 +153,66 @@ async def handle_telephony_completion(
     db.add(order)
     await db.commit()
 
-    # 5. Sync to Storefront (Shopify / WooCommerce)
+    # 5. Delivery Partner Auto-Dispatch (Steadfast / Pathao)
+    courier_result = None
+    if payload.order_confirmed:
+        try:
+            from app.db.models import TenantIntegration
+            from app.services.courier_service import CourierService
+
+            int_stmt = select(TenantIntegration).where(
+                TenantIntegration.tenant_id == payload.tenant_id,
+                TenantIntegration.provider.in_(["steadfast", "pathao", "courier"]),
+                TenantIntegration.is_active == True,
+            )
+            int_res = await db.execute(int_stmt)
+            courier_int = int_res.scalars().first()
+            courier_settings = courier_int.settings if courier_int else {}
+            courier_pref = courier_int.provider if courier_int else None
+
+            courier_result = await CourierService.dispatch_to_delivery_partner(
+                tenant_id=payload.tenant_id,
+                invoice=order.external_order_id,
+                recipient_name=order.customer_name,
+                recipient_phone=order.customer_phone,
+                recipient_address=order.shipping_address,
+                cod_amount=float(order.order_total),
+                courier_pref=courier_pref,
+                tenant_courier_settings=courier_settings,
+            )
+            logger.info(f"[Telephony Callback] Courier dispatch result: {courier_result}")
+        except Exception as e:
+            logger.error(f"[Telephony Callback] Courier auto-dispatch error: {e}")
+
+    # 6. Google Sheets Two-Way Sync
+    sheet_result = None
+    try:
+        from app.db.models import TenantIntegration
+        from app.services.google_sheets_service import GoogleSheetsService
+
+        sheet_stmt = select(TenantIntegration).where(
+            TenantIntegration.tenant_id == payload.tenant_id,
+            TenantIntegration.provider == "google_sheets",
+            TenantIntegration.is_active == True,
+        )
+        sheet_res = await db.execute(sheet_stmt)
+        sheet_int = sheet_res.scalars().first()
+        if sheet_int and sheet_int.settings.get("webhook_url"):
+            tracking = courier_result.get("tracking_code") if courier_result else None
+            courier_name = courier_result.get("courier") if courier_result else None
+            sheet_updated = await GoogleSheetsService.update_order_via_apps_script(
+                webhook_url=sheet_int.settings["webhook_url"],
+                order_id=order.external_order_id,
+                status=new_status,
+                tracking_code=tracking,
+                courier=courier_name,
+                notes=f"Voice Confirmation Call: Confirmed={payload.order_confirmed}. {payload.transcript[:150]}",
+            )
+            sheet_result = {"updated": sheet_updated, "webhook_url": sheet_int.settings["webhook_url"]}
+    except Exception as e:
+        logger.error(f"[Telephony Callback] Google sheets sync error: {e}")
+
+    # 7. Sync to Storefront (Shopify / WooCommerce)
     sync_result = await OrderSyncService.sync_order_status(
         tenant_id=payload.tenant_id,
         external_order_id=order.external_order_id,
@@ -135,6 +227,8 @@ async def handle_telephony_completion(
         "order_id": str(order.id),
         "new_order_status": new_status,
         "storefront_sync": sync_result,
+        "courier_dispatch": courier_result,
+        "google_sheets_sync": sheet_result,
     }
 
 

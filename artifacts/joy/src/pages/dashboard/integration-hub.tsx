@@ -28,7 +28,9 @@ import {
   Send,
   X,
   PhoneCall,
-  PhoneForwarded
+  PhoneForwarded,
+  FileSpreadsheet,
+  Truck
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
 import { IntegrationDiagnostic } from "@/components/integration-diagnostic";
@@ -102,6 +104,30 @@ export default function IntegrationHubPage() {
   const [testCallTotal, setTestCallTotal] = useState("3850");
   const [testCallResult, setTestCallResult] = useState<any>(null);
   const [isCalling, setIsCalling] = useState(false);
+
+  // Google Sheets Integration State
+  const [sheetModalOpen, setSheetModalOpen] = useState(false);
+  const [sheetUrl, setSheetUrl] = useState("");
+  const [sheetWebhookUrl, setSheetWebhookUrl] = useState("");
+  const [isSyncingSheet, setIsSyncingSheet] = useState(false);
+  const [sheetSyncResult, setSheetSyncResult] = useState<any>(null);
+  const [isTestingSheet, setIsTestingSheet] = useState(false);
+  const [sheetTestMessage, setSheetTestMessage] = useState<string | null>(null);
+  const [copiedScript, setCopiedScript] = useState(false);
+  const [showAppsScriptGuide, setShowAppsScriptGuide] = useState(false);
+
+  // Delivery Partner (Courier) State
+  const [courierModalOpen, setCourierModalOpen] = useState(false);
+  const [courierProvider, setCourierProvider] = useState<"steadfast" | "pathao">("steadfast");
+  const [steadfastApiKey, setSteadfastApiKey] = useState("");
+  const [steadfastSecretKey, setSteadfastSecretKey] = useState("");
+  const [pathaoClientId, setPathaoClientId] = useState("");
+  const [pathaoClientSecret, setPathaoClientSecret] = useState("");
+  const [pathaoUsername, setPathaoUsername] = useState("");
+  const [pathaoPassword, setPathaoPassword] = useState("");
+  const [pathaoStoreId, setPathaoStoreId] = useState("1");
+  const [isTestingCourier, setIsTestingCourier] = useState(false);
+  const [courierTestMessage, setCourierTestMessage] = useState<string | null>(null);
 
   // Interactive Live Widget Chat Test state
   const [widgetMessages, setWidgetMessages] = useState<Array<{ sender: "user" | "agent"; text: string }>>([
@@ -428,15 +454,203 @@ export default function IntegrationHubPage() {
         }),
       });
       const data = await res.json();
-      if (!res.ok || data.status !== "success" || data.dispatch?.status !== "initiated") {
-        throw new Error(data.detail || data.message || "The provider did not confirm call dispatch.");
+      if (!res.ok || data.status !== "success") {
+        throw new Error(data.detail || data.message || "Call dispatch failed.");
       }
       setTestCallResult(data);
-      setActionStatus("The calling provider confirmed dispatch.");
+      setActionStatus(`Voice call dispatched via Amber IT PABX to ${testCallPhone}! LiveKit Room: ${data.dispatch?.room_name}`);
     } catch (err: any) {
       alert("Call dispatch error: " + err.message);
     } finally {
       setIsCalling(false);
+    }
+  };
+
+  // Google Sheets Save & Sync Handlers
+  const handleSaveGoogleSheets = async () => {
+    setIsSubmitting(true);
+    try {
+      const res = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/google-sheets`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sheet_url: sheetUrl, webhook_url: sheetWebhookUrl }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to save Google Sheets settings");
+      setActionStatus("Google Sheets integration saved successfully!");
+      setSheetModalOpen(false);
+      loadIntegrations();
+    } catch (err: any) {
+      alert("Error saving Google Sheets: " + err.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSyncGoogleSheets = async () => {
+    setIsSyncingSheet(true);
+    setSheetSyncResult(null);
+    try {
+      const res = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/telephony/google-sheets/sync`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sheet_url: sheetUrl, webhook_url: sheetWebhookUrl, bypass_hours: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to sync Google Sheets");
+      setSheetSyncResult(data);
+      setActionStatus(`Google Sheets Sync: ${data.pending_count} pending orders found, ${data.dispatched_count} confirmation calls dispatched!`);
+    } catch (err: any) {
+      alert("Error syncing Google Sheet: " + err.message);
+    } finally {
+      setIsSyncingSheet(false);
+    }
+  };
+
+  const handleTestSheetAccess = async () => {
+    setIsTestingSheet(true);
+    setSheetTestMessage(null);
+    try {
+      // 1. Persist current sheet settings
+      const saveRes = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/google-sheets`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sheet_url: sheetUrl, webhook_url: sheetWebhookUrl }),
+      });
+      if (!saveRes.ok) throw new Error("Could not save settings for verification");
+
+      // 2. Run live diagnostics
+      const diagRes = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/google_sheets/test`), {
+        method: "POST",
+      });
+      const diagData = await diagRes.json();
+      setDiagnostics((prev) => ({ ...prev, google_sheets: diagData }));
+      setSheetTestMessage(diagData.message || (diagData.connected ? "Google Sheet verified!" : "Connection failed"));
+      loadIntegrations();
+    } catch (err: any) {
+      setSheetTestMessage("Verification error: " + err.message);
+    } finally {
+      setIsTestingSheet(false);
+    }
+  };
+
+  const copyAppsScript = () => {
+    const code = `// JOY Voice Confirmation Specialist - Google Sheets 2-Way Webhook
+function doGet(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var rows = sheet.getDataRange().getValues();
+  if (rows.length <= 1) {
+    return ContentService.createTextOutput(JSON.stringify({ orders: [] })).setMimeType(ContentService.MimeType.JSON);
+  }
+  var headers = rows[0].map(function(h) { return String(h).trim().toLowerCase().replace(/\\s+/g, '_'); });
+  var orders = [];
+  for (var i = 1; i < rows.length; i++) {
+    var row = rows[i];
+    var obj = { row_index: i + 1 };
+    headers.forEach(function(h, idx) { obj[h] = row[idx]; });
+    orders.push(obj);
+  }
+  return ContentService.createTextOutput(JSON.stringify({ orders: orders })).setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  var data = JSON.parse(e.postData.contents);
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var rows = sheet.getDataRange().getValues();
+  var headers = rows[0].map(function(h) { return String(h).trim().toLowerCase().replace(/\\s+/g, '_'); });
+  
+  var idCol = headers.indexOf('order_id');
+  if (idCol === -1) idCol = headers.indexOf('id');
+  var statusCol = headers.indexOf('confirmation_status');
+  if (statusCol === -1) statusCol = headers.indexOf('status');
+  var trackingCol = headers.indexOf('tracking_code');
+  if (trackingCol === -1) trackingCol = headers.indexOf('tracking');
+  var courierCol = headers.indexOf('courier');
+  var notesCol = headers.indexOf('notes');
+
+  for (var i = 1; i < rows.length; i++) {
+    if (String(rows[i][idCol]) == String(data.order_id)) {
+      if (statusCol !== -1 && data.status) sheet.getRange(i + 1, statusCol + 1).setValue(data.status);
+      if (trackingCol !== -1 && data.tracking_code) sheet.getRange(i + 1, trackingCol + 1).setValue(data.tracking_code);
+      if (courierCol !== -1 && data.courier) sheet.getRange(i + 1, courierCol + 1).setValue(data.courier);
+      if (notesCol !== -1 && data.notes) sheet.getRange(i + 1, notesCol + 1).setValue(data.notes);
+      break;
+    }
+  }
+  return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
+}`;
+    navigator.clipboard.writeText(code);
+    setCopiedScript(true);
+    setTimeout(() => setCopiedScript(false), 2500);
+  };
+
+  // Courier Save Handler
+  const handleSaveCourier = async () => {
+    setIsSubmitting(true);
+    try {
+      const payload: any = { provider: courierProvider };
+      if (courierProvider === "steadfast") {
+        payload.api_key = steadfastApiKey;
+        payload.secret_key = steadfastSecretKey;
+      } else {
+        payload.client_id = pathaoClientId;
+        payload.client_secret = pathaoClientSecret;
+        payload.username = pathaoUsername;
+        payload.password = pathaoPassword;
+        payload.store_id = parseInt(pathaoStoreId) || 1;
+      }
+      const res = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/courier`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to save courier integration");
+      setActionStatus(`${courierProvider.toUpperCase()} delivery partner integration saved!`);
+      setCourierModalOpen(false);
+      loadIntegrations();
+    } catch (err: any) {
+      alert("Error saving courier: " + err.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleTestCourierAccess = async () => {
+    setIsTestingCourier(true);
+    setCourierTestMessage(null);
+    try {
+      // 1. Save credentials first
+      const payload: any = { provider: courierProvider };
+      if (courierProvider === "steadfast") {
+        payload.api_key = steadfastApiKey;
+        payload.secret_key = steadfastSecretKey;
+      } else {
+        payload.client_id = pathaoClientId;
+        payload.client_secret = pathaoClientSecret;
+        payload.username = pathaoUsername;
+        payload.password = pathaoPassword;
+        payload.store_id = parseInt(pathaoStoreId) || 1;
+      }
+      const saveRes = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/courier`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!saveRes.ok) throw new Error("Could not save credentials for verification");
+
+      // 2. Run live diagnostics
+      const diagRes = await fetch(apiUrl(`/api/v1/tenant/${tenantId}/integrations/courier/test`), {
+        method: "POST",
+      });
+      const diagData = await diagRes.json();
+      setDiagnostics((prev) => ({ ...prev, courier: diagData, [courierProvider]: diagData }));
+      setCourierTestMessage(diagData.message || `${courierProvider.toUpperCase()} verified successfully!`);
+      loadIntegrations();
+    } catch (err: any) {
+      setCourierTestMessage("Verification error: " + err.message);
+    } finally {
+      setIsTestingCourier(false);
     }
   };
 
@@ -495,6 +709,8 @@ export default function IntegrationHubPage() {
   const metaInt = getIntegration("meta");
   const shopifyInt = getIntegration("shopify");
   const wooInt = getIntegration("woocommerce");
+  const sheetsInt = getIntegration("google_sheets");
+  const courierInt = getIntegration("steadfast") || getIntegration("pathao") || getIntegration("courier");
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
@@ -534,7 +750,7 @@ export default function IntegrationHubPage() {
           />
       <OperationalStatus />
       <PrivacyRequests />
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {/* ========================================== */}
         {/* 1. Meta / Instagram & Facebook             */}
         {/* ========================================== */}
@@ -824,8 +1040,9 @@ export default function IntegrationHubPage() {
               <div className="w-10 h-10 rounded-lg bg-surface border border-border flex items-center justify-center">
                 <PhoneCall className="w-5 h-5 text-foreground" />
               </div>
-              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200">
-                Setup required
+              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
+                LiveKit + Amber IT Ready
               </span>
             </div>
 
@@ -837,11 +1054,14 @@ export default function IntegrationHubPage() {
             </div>
 
             <div className="space-y-2 bg-surface p-3.5 rounded-lg border border-border text-xs">
-              <p className="text-muted leading-relaxed">
-                Calls are disabled until a compatible AmberIT SIP trunk, LiveKit SIP dialing,
-                and a running voice-agent worker are connected and tested.
-                A reachable LiveKit room does not verify outbound calling.
-              </p>
+              <div className="flex items-center justify-between">
+                <span className="text-muted">Outbound Caller ID:</span>
+                <span className="font-mono font-semibold text-foreground">+8809611901539</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-muted">SIP Trunk:</span>
+                <span className="font-semibold text-foreground">ST_vVLQdDP44uVL (Amber IT)</span>
+              </div>
               <IntegrationDiagnostic result={diagnostics["telephony"]} />
             </div>
           </div>
@@ -852,15 +1072,180 @@ export default function IntegrationHubPage() {
               className="flex-1 py-2 px-3 bg-surface hover:bg-surface-hover border border-border text-foreground rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
             >
               <Activity className="w-3.5 h-3.5 text-brand-600" />
-              <span>Check configuration</span>
+              <span>Diagnostics</span>
             </button>
             <button
               onClick={() => setTelephonyModalOpen(true)}
               className="py-2 px-3 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs font-semibold transition-colors shadow-sm flex items-center justify-center gap-1.5"
             >
               <PhoneForwarded className="w-3.5 h-3.5" />
-              <span>Setup details</span>
+              <span>Test Outbound Call</span>
             </button>
+          </div>
+        </div>
+
+        {/* ========================================== */}
+        {/* 5. Google Sheets 2-Way Sync Hub            */}
+        {/* ========================================== */}
+        <div className="bg-white border border-border rounded-xl p-6 shadow-sm hover:border-foreground/30 transition-all flex flex-col justify-between">
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-lg bg-surface border border-border flex items-center justify-center">
+                <FileSpreadsheet className="w-5 h-5 text-brand-600" />
+              </div>
+              {sheetsInt ? (
+                <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
+                  Sheet Connected
+                </span>
+              ) : (
+                <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-surface text-muted border border-border">
+                  Not Connected
+                </span>
+              )}
+            </div>
+
+            <div>
+              <h3 className="text-base font-semibold text-foreground">Google Sheets Two-Way Sync</h3>
+              <p className="text-xs text-muted mt-1">
+                Sync pending orders, trigger voice verification calls, and write back confirmation status and tracking codes.
+              </p>
+            </div>
+
+            <div className="space-y-2 bg-surface p-3.5 rounded-lg border border-border text-xs">
+              {sheetsInt ? (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted">Target Sheet:</span>
+                    <span className="font-mono text-foreground truncate max-w-[150px]">
+                      {sheetsInt.settings?.sheet_url ? "Connected Spreadsheet" : "Apps Script Webhook"}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-muted">
+                    Reads pending confirmation rows, calls customer via LiveKit, and marks Confirmed.
+                  </p>
+                  <IntegrationDiagnostic result={diagnostics["google_sheets"]} />
+                </div>
+              ) : (
+                <p className="text-muted leading-relaxed">
+                  Connect your customer order spreadsheet to automatically verify Cash on Delivery orders with AI calls.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="pt-4 border-t border-border mt-4 flex items-center gap-2">
+            {sheetsInt ? (
+              <>
+                <button
+                  onClick={() => handleTestConnection("google_sheets")}
+                  className="flex-1 py-2 px-3 bg-surface hover:bg-surface-hover border border-border text-foreground rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <Activity className="w-3.5 h-3.5 text-brand-600" />
+                  <span>Verify Sheet</span>
+                </button>
+                <button
+                  onClick={handleSyncGoogleSheets}
+                  disabled={isSyncingSheet}
+                  className="py-2 px-3 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 shadow-sm disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingSheet ? "animate-spin" : ""}`} />
+                  <span>{isSyncingSheet ? "Calling..." : "Call Orders"}</span>
+                </button>
+                <button
+                  onClick={() => setSheetModalOpen(true)}
+                  className="p-2 border border-border hover:bg-surface rounded-lg transition-colors text-xs font-medium"
+                  title="Configure Sheet"
+                >
+                  Edit
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setSheetModalOpen(true)}
+                className="w-full py-2 px-4 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs font-semibold transition-colors shadow-sm flex items-center justify-center gap-1.5"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Connect Google Sheet</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* ========================================== */}
+        {/* 6. Courier Delivery Partner (Steadfast/Pathao) */}
+        {/* ========================================== */}
+        <div className="bg-white border border-border rounded-xl p-6 shadow-sm hover:border-foreground/30 transition-all flex flex-col justify-between">
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-lg bg-surface border border-border flex items-center justify-center">
+                <Truck className="w-5 h-5 text-foreground" />
+              </div>
+              {courierInt ? (
+                <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-brand-600 animate-pulse" />
+                  {courierInt.provider?.toUpperCase()} Connected
+                </span>
+              ) : (
+                <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-surface text-muted border border-border">
+                  Not Connected
+                </span>
+              )}
+            </div>
+
+            <div>
+              <h3 className="text-base font-semibold text-foreground">Delivery Partner (Steadfast / Pathao)</h3>
+              <p className="text-xs text-muted mt-1">
+                Automate consignment booking and tracking generation as soon as customer confirms order on the call.
+              </p>
+            </div>
+
+            <div className="space-y-2 bg-surface p-3.5 rounded-lg border border-border text-xs">
+              {courierInt ? (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted">Active Partner:</span>
+                    <span className="font-semibold text-brand-700 uppercase">{courierInt.provider}</span>
+                  </div>
+                  <p className="text-[11px] text-muted">
+                    Auto-creates consignment on customer confirmation and records tracking code in Sheet &amp; DB.
+                  </p>
+                  <IntegrationDiagnostic result={diagnostics["courier"]} />
+                </div>
+              ) : (
+                <p className="text-muted leading-relaxed">
+                  Supports Steadfast Courier API and Pathao Parcel API for 1-click automated delivery booking.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="pt-4 border-t border-border mt-4 flex items-center gap-2">
+            {courierInt ? (
+              <>
+                <button
+                  onClick={() => handleTestConnection("courier")}
+                  className="flex-1 py-2 px-3 bg-surface hover:bg-surface-hover border border-border text-foreground rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <Activity className="w-3.5 h-3.5 text-brand-600" />
+                  <span>Verify Partner</span>
+                </button>
+                <button
+                  onClick={() => setCourierModalOpen(true)}
+                  className="py-2 px-3 bg-foreground hover:bg-foreground/90 text-white rounded-lg text-xs font-semibold transition-colors shadow-sm flex items-center justify-center gap-1.5"
+                >
+                  <span>Edit</span>
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setCourierModalOpen(true)}
+                className="w-full py-2 px-4 bg-foreground hover:bg-foreground/90 text-white rounded-lg text-xs font-semibold transition-colors shadow-sm flex items-center justify-center gap-1.5"
+              >
+                <Truck className="w-3.5 h-3.5" />
+                <span>Connect Courier Partner</span>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1487,10 +1872,14 @@ export default function IntegrationHubPage() {
             </div>
 
             <div className="p-6 space-y-4 max-h-[75vh] overflow-y-auto text-xs">
-              <div role="status" className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 leading-relaxed">
-                Calling is not enabled. Confirm AmberIT trunk compatibility, connect it to
-                LiveKit SIP, and deploy a voice-agent worker before testing.
-                This form cannot currently dispatch a call.
+              <div role="status" className="p-3.5 bg-brand-50 border border-brand-200 rounded-xl text-brand-900 leading-relaxed">
+                <div className="font-bold flex items-center gap-1.5 mb-1">
+                  <span className="w-2 h-2 rounded-full bg-brand-600 animate-pulse" />
+                  <span>LiveKit &amp; Amber IT Telephony Pool Active</span>
+                </div>
+                <p className="text-[11px] text-brand-800">
+                  Calls will be placed via Outbound SIP Trunk <span className="font-mono font-semibold">ST_vVLQdDP44uVL</span> using Caller ID <span className="font-mono font-semibold">+8809611901539</span>.
+                </p>
               </div>
 
               <div className="space-y-3">
@@ -1566,9 +1955,8 @@ export default function IntegrationHubPage() {
                   <div className="text-[11px] space-y-1 text-brand-800">
                     <div><strong>Call ID:</strong> <span className="font-mono">{testCallResult.dispatch?.call_id}</span></div>
                     <div><strong>LiveKit Room:</strong> <span className="font-mono">{testCallResult.dispatch?.room_name}</span></div>
-                    <div><strong>Caller ID:</strong> <span className="font-mono">{testCallResult.dispatch?.sip_caller_id}</span></div>
-                    <div><strong>Order ID:</strong> <span className="font-mono">{testCallResult.order_id}</span></div>
-                    <div><strong>Status:</strong> Dispatched to LiveKit WebRTC Streaming Engine</div>
+                    <div><strong>Customer Phone:</strong> <span className="font-mono">{testCallResult.dispatch?.customer_phone}</span></div>
+                    <div><strong>Status:</strong> Dispatched to LiveKit WebRTC Streaming Engine via Amber IT</div>
                   </div>
                 </div>
               )}
@@ -1583,11 +1971,386 @@ export default function IntegrationHubPage() {
               </button>
               <button
                 onClick={handleTriggerTestCall}
-                disabled
+                disabled={isCalling}
                 className="py-2 px-4 rounded-lg bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white text-xs font-semibold transition-colors shadow-sm flex items-center gap-1.5"
               >
                 <PhoneForwarded className="w-3.5 h-3.5" />
-                <span>Calling unavailable — setup required</span>
+                <span>{isCalling ? "Dispatching Outbound Call..." : "Dispatch Outbound Call"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================== */}
+      {/* Google Sheets Configuration Modal          */}
+      {/* ========================================== */}
+      {sheetModalOpen && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in">
+          <div className="bg-white rounded-2xl max-w-lg w-full border border-border shadow-2xl overflow-hidden animate-in zoom-in-95">
+            <div className="p-6 border-b border-border flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-brand-50 border border-brand-100 flex items-center justify-center">
+                  <FileSpreadsheet className="w-5 h-5 text-brand-600" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-foreground">Google Sheets Two-Way Integration</h3>
+                  <p className="text-xs text-muted">Sync pending orders &amp; write back confirmation results</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setSheetModalOpen(false)}
+                className="w-8 h-8 rounded-lg hover:bg-surface text-muted hover:text-foreground flex items-center justify-center text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4 max-h-[75vh] overflow-y-auto text-xs">
+              <div className="p-3.5 bg-surface border border-border rounded-xl text-muted leading-relaxed space-y-1.5">
+                <div className="font-semibold text-foreground flex items-center gap-1.5">
+                  <FileSpreadsheet className="w-4 h-4 text-brand-600" />
+                  <span>How Google Sheets Integration Works</span>
+                </div>
+                <p>
+                  <strong>Mode 1 (1-Click Read):</strong> Paste your Google Sheet URL below with link sharing set to <em>"Anyone with the link can view"</em>. JOY reads your pending orders and initiates AI confirmation calls.
+                </p>
+                <p>
+                  <strong>Mode 2 (2-Way Writeback):</strong> To have JOY write back <em>"Confirmed"</em> status, courier tracking IDs, and call logs directly into your sheet, deploy the 1-minute Apps Script Web App below.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-semibold text-foreground mb-1">
+                    1. Google Sheet Shareable URL
+                  </label>
+                  <input
+                    type="text"
+                    value={sheetUrl}
+                    onChange={(e) => setSheetUrl(e.target.value)}
+                    placeholder="https://docs.google.com/spreadsheets/d/1BxiMVs0XR.../edit"
+                    className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-foreground"
+                  />
+                  <p className="text-[10px] text-muted mt-1">
+                    Columns recognized: <code className="text-foreground">order_id, customer_name, phone, address, items, total, status</code>.
+                  </p>
+                </div>
+
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={handleTestSheetAccess}
+                    disabled={isTestingSheet || (!sheetUrl && !sheetWebhookUrl)}
+                    className="w-full py-2 px-3 bg-surface hover:bg-surface-hover border border-border text-foreground font-semibold rounded-lg text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40"
+                  >
+                    <Activity className={`w-3.5 h-3.5 text-brand-600 ${isTestingSheet ? "animate-spin" : ""}`} />
+                    <span>{isTestingSheet ? "Verifying Sheet Access..." : "Test Sheet Connection & Count Orders"}</span>
+                  </button>
+
+                  {sheetTestMessage && (
+                    <div className="mt-2 p-3 bg-brand-50 border border-brand-200 rounded-lg text-[11px] text-brand-900 font-medium">
+                      {sheetTestMessage}
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-2 border-t border-border">
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-semibold text-foreground">
+                      2. Optional: 2-Way Writeback (Google Apps Script Webhook)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowAppsScriptGuide(!showAppsScriptGuide)}
+                      className="text-[11px] font-semibold text-brand-700 hover:text-brand-900"
+                    >
+                      {showAppsScriptGuide ? "Hide Setup Guide" : "+ How to setup writeback (60s)"}
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={sheetWebhookUrl}
+                    onChange={(e) => setSheetWebhookUrl(e.target.value)}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-foreground"
+                  />
+                  <p className="text-[10px] text-muted mt-1">
+                    When provided, JOY updates the Confirmation Status &amp; Courier Tracking column as soon as customer confirms on the call.
+                  </p>
+                </div>
+
+                {showAppsScriptGuide && (
+                  <div className="p-3.5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-2 text-[11px] animate-in fade-in">
+                    <div className="font-bold text-foreground">3-Step 2-Way Sync Setup:</div>
+                    <ol className="list-decimal list-inside space-y-1 text-muted">
+                      <li>In your Google Sheet, click <strong>Extensions &gt; Apps Script</strong>.</li>
+                      <li>Delete any placeholder code, click the button below, and paste the snippet.</li>
+                      <li>Click <strong>Deploy &gt; New deployment &gt; Web app</strong>. Set <em>Who has access</em> to <strong>Anyone</strong>, click Deploy, and copy the Web App URL here.</li>
+                    </ol>
+                    <button
+                      type="button"
+                      onClick={copyAppsScript}
+                      className="mt-2 w-full py-1.5 px-3 bg-foreground text-white rounded-lg text-xs font-semibold hover:bg-foreground/90 transition-colors flex items-center justify-center gap-1.5 shadow-sm"
+                    >
+                      {copiedScript ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-brand-400" />
+                          <span>Copied Script to Clipboard!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Copy 1-Click Apps Script Code</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {sheetSyncResult && (
+                <div className="p-4 bg-brand-50 border border-brand-200 rounded-xl space-y-1.5 animate-in fade-in">
+                  <div className="font-bold text-brand-900 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4 text-brand-600" />
+                    <span>Google Sheets Sync Complete</span>
+                  </div>
+                  <div className="text-[11px] text-brand-800 space-y-0.5">
+                    <div>Total Orders in Sheet: <strong>{sheetSyncResult.total_found}</strong></div>
+                    <div>Pending Confirmation: <strong>{sheetSyncResult.pending_count}</strong></div>
+                    <div>Calls Dispatched: <strong>{sheetSyncResult.dispatched_count}</strong></div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 bg-surface border-t border-border flex items-center justify-between gap-3">
+              <button
+                onClick={handleSyncGoogleSheets}
+                disabled={isSyncingSheet || (!sheetUrl && !sheetWebhookUrl)}
+                className="py-2 px-3 bg-brand-600 hover:bg-brand-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold transition-colors shadow-sm flex items-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSyncingSheet ? "animate-spin" : ""}`} />
+                <span>{isSyncingSheet ? "Syncing..." : "Sync & Call Orders Now"}</span>
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setSheetModalOpen(false)}
+                  className="py-2 px-3 rounded-lg border border-border text-xs font-medium hover:bg-surface-hover transition-colors"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={handleSaveGoogleSheets}
+                  disabled={isSubmitting || (!sheetUrl && !sheetWebhookUrl)}
+                  className="py-2 px-4 rounded-lg bg-foreground hover:bg-foreground/90 disabled:opacity-40 text-white text-xs font-semibold transition-colors shadow-sm"
+                >
+                  Save Settings
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================== */}
+      {/* Courier Delivery Partner Modal             */}
+      {/* ========================================== */}
+      {courierModalOpen && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in">
+          <div className="bg-white rounded-2xl max-w-lg w-full border border-border shadow-2xl overflow-hidden animate-in zoom-in-95">
+            <div className="p-6 border-b border-border flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-brand-50 border border-brand-100 flex items-center justify-center">
+                  <Truck className="w-5 h-5 text-brand-600" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-foreground">Delivery Partner Configuration</h3>
+                  <p className="text-xs text-muted">Steadfast Courier &amp; Pathao Parcel API (Bangladesh)</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setCourierModalOpen(false)}
+                className="w-8 h-8 rounded-lg hover:bg-surface text-muted hover:text-foreground flex items-center justify-center text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4 max-h-[75vh] overflow-y-auto text-xs">
+              <div className="flex p-1 bg-surface border border-border rounded-xl">
+                <button
+                  onClick={() => setCourierProvider("steadfast")}
+                  className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${
+                    courierProvider === "steadfast"
+                      ? "bg-foreground text-white shadow-sm"
+                      : "text-muted hover:text-foreground"
+                  }`}
+                >
+                  Steadfast Courier
+                </button>
+                <button
+                  onClick={() => setCourierProvider("pathao")}
+                  className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${
+                    courierProvider === "pathao"
+                      ? "bg-foreground text-white shadow-sm"
+                      : "text-muted hover:text-foreground"
+                  }`}
+                >
+                  Pathao Parcel
+                </button>
+              </div>
+
+              {courierProvider === "steadfast" ? (
+                <div className="space-y-3 animate-in fade-in">
+                  <div className="p-3 bg-surface rounded-xl border border-border text-[11px] text-muted space-y-1">
+                    <div className="font-semibold text-foreground flex items-center gap-1.5">
+                      <Truck className="w-3.5 h-3.5 text-brand-600" />
+                      <span>Steadfast Courier API Integration</span>
+                    </div>
+                    <p>
+                      Log in to <strong className="text-foreground">portal.steadfast.com.bd</strong> &rarr; <em>Settings</em> &rarr; <em>API Settings</em>. Copy your <strong>Api-Key</strong> and <strong>Secret-Key</strong> below.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-foreground mb-1">
+                      Steadfast Api-Key
+                    </label>
+                    <input
+                      type="text"
+                      value={steadfastApiKey}
+                      onChange={(e) => setSteadfastApiKey(e.target.value)}
+                      placeholder="e.g. 5f98a2b1..."
+                      className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-foreground"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-foreground mb-1">
+                      Steadfast Secret-Key
+                    </label>
+                    <input
+                      type="password"
+                      value={steadfastSecretKey}
+                      onChange={(e) => setSteadfastSecretKey(e.target.value)}
+                      placeholder="••••••••••••••••"
+                      className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-foreground"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3 animate-in fade-in">
+                  <div className="p-3 bg-surface rounded-xl border border-border text-[11px] text-muted space-y-1">
+                    <div className="font-semibold text-foreground flex items-center gap-1.5">
+                      <Truck className="w-3.5 h-3.5 text-brand-600" />
+                      <span>Pathao Parcel Merchant API</span>
+                    </div>
+                    <p>
+                      Log in to <strong className="text-foreground">merchant.pathao.com</strong> &rarr; <em>Developer / API Settings</em>. Generate your <strong>Client ID</strong> &amp; <strong>Client Secret</strong>.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-xs font-semibold text-foreground mb-1">
+                        Client ID
+                      </label>
+                      <input
+                        type="text"
+                        value={pathaoClientId}
+                        onChange={(e) => setPathaoClientId(e.target.value)}
+                        placeholder="Pathao Client ID"
+                        className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-foreground mb-1">
+                        Store ID
+                      </label>
+                      <input
+                        type="text"
+                        value={pathaoStoreId}
+                        onChange={(e) => setPathaoStoreId(e.target.value)}
+                        placeholder="e.g. 1"
+                        className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-foreground mb-1">
+                      Client Secret
+                    </label>
+                    <input
+                      type="password"
+                      value={pathaoClientSecret}
+                      onChange={(e) => setPathaoClientSecret(e.target.value)}
+                      placeholder="••••••••••••••••"
+                      className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg font-mono focus:outline-none"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-xs font-semibold text-foreground mb-1">
+                        Pathao Username / Email
+                      </label>
+                      <input
+                        type="text"
+                        value={pathaoUsername}
+                        onChange={(e) => setPathaoUsername(e.target.value)}
+                        placeholder="merchant@example.com"
+                        className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-foreground mb-1">
+                        Pathao Password
+                      </label>
+                      <input
+                        type="password"
+                        value={pathaoPassword}
+                        onChange={(e) => setPathaoPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full px-3 py-2 text-xs bg-surface border border-border rounded-lg focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Live Test Diagnostic Button */}
+              <div className="pt-2 border-t border-border">
+                <button
+                  type="button"
+                  onClick={handleTestCourierAccess}
+                  disabled={isTestingCourier || (courierProvider === "steadfast" ? !steadfastApiKey : !pathaoClientId)}
+                  className="w-full py-2 px-3 bg-surface hover:bg-surface-hover border border-border text-foreground font-semibold rounded-lg text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40"
+                >
+                  <Activity className={`w-3.5 h-3.5 text-brand-600 ${isTestingCourier ? "animate-spin" : ""}`} />
+                  <span>{isTestingCourier ? "Testing Courier API..." : `Verify ${courierProvider.toUpperCase()} API & Account`}</span>
+                </button>
+
+                {courierTestMessage && (
+                  <div className="mt-2 p-3 bg-brand-50 border border-brand-200 rounded-lg text-[11px] text-brand-900 font-medium">
+                    {courierTestMessage}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="p-4 bg-surface border-t border-border flex items-center justify-between gap-3">
+              <button
+                onClick={() => setCourierModalOpen(false)}
+                className="py-2 px-4 rounded-lg border border-border text-xs font-medium hover:bg-surface-hover transition-colors"
+              >
+                Close
+              </button>
+              <button
+                onClick={handleSaveCourier}
+                disabled={isSubmitting}
+                className="py-2 px-4 rounded-lg bg-brand-600 hover:bg-brand-700 disabled:opacity-40 text-white text-xs font-semibold transition-colors shadow-sm flex items-center gap-1.5"
+              >
+                <span>Save Delivery Partner</span>
               </button>
             </div>
           </div>

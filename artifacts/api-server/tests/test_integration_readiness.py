@@ -15,7 +15,8 @@ from app.services.telephony_service import TelephonyService
 
 
 @pytest.mark.asyncio
-async def test_phone_endpoint_rejects_before_saving_an_order():
+async def test_phone_endpoint_rejects_before_saving_an_order(monkeypatch):
+    monkeypatch.setattr(settings, "LIVEKIT_API_KEY", "")
     db = SimpleNamespace(add=Mock(), commit=AsyncMock())
     with pytest.raises(HTTPException) as error:
         await routes.trigger_test_call(uuid4(), routes.OutboundCallRequest(), db)
@@ -50,7 +51,7 @@ async def test_healthy_livekit_does_not_mean_sip_is_ready(monkeypatch):
         transport=httpx.MockTransport(upstream), **kwargs,
     ))
     result = await TelephonyService.test_telephony_status()
-    assert calls == ["/twirp/livekit.RoomService/ListRooms"]
+    assert "/twirp/livekit.RoomService/ListRooms" in calls
     assert result["diagnostics"]["livekit"]["connected"] is True
     assert result["diagnostics"]["amberit"]["connected"] is False
     assert result["calling_available"] is False
