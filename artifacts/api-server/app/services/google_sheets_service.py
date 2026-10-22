@@ -43,7 +43,7 @@ class GoogleSheetsService:
         return cleaned
 
     @staticmethod
-    async def _apps_script_client():
+    def _apps_script_client():
         return httpx.AsyncClient(
             timeout=15.0,
             follow_redirects=True,
@@ -70,7 +70,7 @@ class GoogleSheetsService:
         GET {webhook_url}?action=get_pending_orders
         """
         await GoogleSheetsService._validate_apps_script_url(webhook_url)
-        async with await GoogleSheetsService._apps_script_client() as client:
+        async with GoogleSheetsService._apps_script_client() as client:
             try:
                 resp = await client.get(webhook_url, params={"action": "get_pending_orders"})
                 if resp.status_code == 200:
@@ -108,7 +108,7 @@ class GoogleSheetsService:
             "notes": notes or f"Call completed on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         }
         await GoogleSheetsService._validate_apps_script_url(webhook_url)
-        async with await GoogleSheetsService._apps_script_client() as client:
+        async with GoogleSheetsService._apps_script_client() as client:
             try:
                 resp = await client.post(webhook_url, json=payload)
                 if resp.status_code not in (200, 201):
@@ -190,6 +190,7 @@ class GoogleSheetsService:
         from app.db.models import Order
         from app.agents.voice_confirmation import VoiceConfirmationAgent
         import uuid
+        import re
 
         webhook_url = sheet_config.get("webhook_url")
         sheet_url = sheet_config.get("sheet_url") or sheet_config.get("sheet_id")
@@ -208,29 +209,54 @@ class GoogleSheetsService:
         ]
 
         dispatched_count = 0
+        fallback_count = 0
+        skipped_count = 0
         results = []
 
         for item in pending:
             phone = str(item.get("customer_phone") or item.get("phone", "")).strip()
-            if not phone:
+            digits = re.sub(r"\D", "", phone)
+            if digits.startswith("01") and len(digits) == 11:
+                phone = f"+880{digits[1:]}"
+            elif digits.startswith("880"):
+                phone = f"+{digits}"
+            elif phone.startswith("+"):
+                phone = f"+{digits}"
+            else:
+                phone = ""
+            if not phone or not (8 <= len(digits) <= 15):
+                skipped_count += 1
                 continue
 
+            external_order_id = str(item.get("order_id") or f"GS-{uuid.uuid4().hex[:6].upper()}")[:255]
             order_id = uuid.uuid4()
-            order = Order(
+            order_data = dict(
                 id=order_id,
                 tenant_id=tenant_id,
-                external_order_id=str(item.get("order_id") or f"GS-{uuid.uuid4().hex[:6].upper()}"),
+                external_order_id=external_order_id,
                 storefront_provider="google_sheets",
-                customer_name=str(item.get("customer_name") or "Valued Customer"),
+                customer_name=str(item.get("customer_name") or "Customer")[:255],
                 customer_phone=phone,
-                shipping_address=str(item.get("shipping_address") or "Bangladesh"),
-                order_total=float(item.get("order_total") or 0.0),
+                shipping_address=str(item.get("shipping_address") or "Address not provided"),
+                order_total=max(0.0, float(item.get("order_total") or 0.0)),
                 status="pending_confirmation",
                 confirmation_channel="voice",
-                call_attempts=1,
+                call_attempts=0,
             )
-            db_session.add(order)
+            stmt = insert(Order).values(**order_data).on_conflict_do_nothing(
+                index_elements=["tenant_id", "storefront_provider", "external_order_id"]
+            ).returning(Order.id)
+            inserted_id = (await db_session.execute(stmt)).scalar_one_or_none()
             await db_session.commit()
+            if inserted_id is None:
+                skipped_count += 1
+                continue
+
+            order_stmt = select(Order).where(Order.id == inserted_id, Order.tenant_id == tenant_id)
+            order = (await db_session.execute(order_stmt)).scalars().first()
+            if not order:
+                skipped_count += 1
+                continue
 
             # Trigger Confirmation Call
             call_res = await VoiceConfirmationAgent.process_order_confirmation(
@@ -242,7 +268,7 @@ class GoogleSheetsService:
             dispatch_status = call_res.get("status")
             if dispatch_status == "call_dispatched":
                 dispatched_count += 1
-            elif dispatch_status == "fallback_dispatched":
+            elif dispatch_status == "verification_link_created":
                 fallback_count += 1
             results.append({
                 "order_id": str(order.id),

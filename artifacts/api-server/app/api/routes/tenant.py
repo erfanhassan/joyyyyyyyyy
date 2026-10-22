@@ -648,10 +648,11 @@ async def test_integration_connection(
     if provider in ("telephony", "amberit", "livekit"):
         return await TelephonyService.test_telephony_status()
 
-    if provider in ("courier", "steadfast", "pathao"):
+    if provider == "courier":
         stmt = select(TenantIntegration).where(
             TenantIntegration.tenant_id == tenant_id,
             TenantIntegration.provider.in_(["steadfast", "pathao", "courier"]),
+            TenantIntegration.is_active == True,
         )
         res = await db.execute(stmt)
         integration = res.scalars().first()
@@ -674,6 +675,8 @@ async def test_integration_connection(
     # Verify decryption
     try:
         raw_token = decrypt_token(integration.access_token_encrypted)
+        from app.core.safety import open_credentials
+        integration_settings = open_credentials(integration.settings or {})
         is_token_valid = len(raw_token) > 0
     except Exception:
         return {
@@ -685,9 +688,9 @@ async def test_integration_connection(
 
     # Provider specific diagnostics
     if provider == "meta":
-        page_name = integration.settings.get("page_name", "Facebook Page")
-        page_id = integration.settings.get("page_id", "")
-        ig_id = integration.settings.get("instagram_account_id", "")
+        page_name = integration_settings.get("page_name", "Facebook Page")
+        page_id = integration_settings.get("page_id", "")
+        ig_id = integration_settings.get("instagram_account_id", "")
         t0 = time.monotonic()
         try:
             identity = await MetaAPIClient.get_page_identity(page_id, raw_token)
@@ -721,7 +724,7 @@ async def test_integration_connection(
             "status": "not_verified",
             "provider": "shopify",
             "connected": False,
-            "shop_domain": integration.settings.get("shop_domain", "store.myshopify.com"),
+            "shop_domain": integration_settings.get("shop_domain", "store.myshopify.com"),
             "webhook_endpoint": f"/api/v1/webhooks/shopify/{tenant_id}",
             "message": "Shopify credentials are stored. Live API access and webhook delivery have not been verified.",
         }
@@ -730,14 +733,14 @@ async def test_integration_connection(
             "status": "not_verified",
             "provider": "woocommerce",
             "connected": False,
-            "store_url": integration.settings.get("store_url", "https://mystore.com"),
+            "store_url": integration_settings.get("store_url", "https://mystore.com"),
             "webhook_endpoint": f"/api/v1/webhooks/woocommerce/{tenant_id}",
             "message": "WooCommerce credentials are stored. Live API access and webhook delivery have not been verified.",
         }
     elif provider == "google_sheets":
         from app.services.google_sheets_service import GoogleSheetsService
-        sheet_url = integration.settings.get("sheet_url")
-        webhook_url = integration.settings.get("webhook_url")
+        sheet_url = integration_settings.get("sheet_url")
+        webhook_url = integration_settings.get("webhook_url")
         try:
             orders = []
             method = "Apps Script Webhook" if webhook_url else "Direct CSV Reader"
@@ -748,7 +751,7 @@ async def test_integration_connection(
                 orders = await GoogleSheetsService.fetch_orders_from_csv_export(sheet_id)
 
             pending = [o for o in orders if str(o.get("status", "")).lower() in ("pending", "pending_confirmation", "unconfirmed", "")]
-            is_ok = len(orders) > 0 or bool(sheet_url or webhook_url)
+            is_ok = bool(sheet_url or webhook_url)
             return {
                 "status": "healthy" if is_ok else "unconfigured",
                 "provider": "google_sheets",
@@ -756,19 +759,26 @@ async def test_integration_connection(
                 "sync_method": method,
                 "total_orders": len(orders),
                 "pending_orders": len(pending),
-                "message": f"Verified Google Sheet ({method})! Found {len(orders)} total orders, {len(pending)} pending phone confirmation.",
+                "message": f"Google Sheets endpoint responded successfully ({method}). Found {len(orders)} total orders, {len(pending)} pending phone confirmation.",
             }
         except Exception as e:
             return {
                 "status": "error",
                 "provider": "google_sheets",
                 "connected": False,
-                "message": f"Could not read Google Sheet: {e}",
+                "message": f"Could not read Google Sheet: {str(e)[:200]}",
             }
     elif provider in ("steadfast", "pathao", "courier"):
         from app.services.courier_service import CourierService
-        actual_provider = integration.settings.get("provider", provider if provider != "courier" else "steadfast")
-        verification = await CourierService.verify_credentials(actual_provider, integration.settings)
+        actual_provider = integration_settings.get("provider", provider)
+        if provider != "courier" and actual_provider != provider:
+            return {
+                "status": "unconfigured",
+                "provider": provider,
+                "connected": False,
+                "message": f"No active {provider} integration was found.",
+            }
+        verification = await CourierService.verify_credentials(actual_provider, integration_settings)
         return {
             "status": "healthy" if verification.get("connected") else "error",
             "provider": actual_provider,
@@ -790,25 +800,16 @@ async def test_integration_connection(
 # Telephony Diagnostics & Live Test Call
 # ==========================================
 class OutboundCallRequest(BaseModel):
-    customer_phone: str = Field(default="+8801712345678", description="Bangladeshi or international phone number")
-    customer_name: str = Field(default="Tahmid Rahman")
-    shipping_address: str = Field(default="House 42, Road 11, Banani, Dhaka")
-    order_items: str = Field(default="Silk Jamdani Panjabi (Size L)")
-    order_total: float = Field(default=3850.00)
-
-
-@router.get("/{tenant_id}/telephony/status")
-async def get_telephony_status(tenant_id: UUID):
-    """
-    Returns real-time health and diagnostics for LiveKit Cloud WebRTC and Amber IT Bangladesh PABX.
-    """
-    return await TelephonyService.test_telephony_status()
+    customer_phone: str = Field(min_length=7, max_length=25, pattern=r"^\+?[0-9][0-9\s().-]{6,24}$")
+    customer_name: str = Field(min_length=1, max_length=255)
+    shipping_address: str = Field(min_length=1, max_length=1000)
+    order_items: str = Field(min_length=1, max_length=1000)
+    order_total: float = Field(ge=0, le=99999999.99)
 
 
 class GoogleSheetSyncRequest(BaseModel):
     sheet_url: Optional[str] = None
     webhook_url: Optional[str] = None
-    bypass_hours: bool = False
 
 
 class GoogleSheetConfigRequest(BaseModel):
@@ -920,15 +921,14 @@ async def sync_google_sheets(
     int_res = await db.execute(int_stmt)
     sheet_int = int_res.scalars().first()
 
+    from app.core.safety import open_credentials
     config = {}
     if sheet_int and sheet_int.settings:
-        config.update(sheet_int.settings)
+        config.update(open_credentials(sheet_int.settings))
     if payload.sheet_url:
         config["sheet_url"] = payload.sheet_url
     if payload.webhook_url:
         config["webhook_url"] = payload.webhook_url
-    config["bypass_hours"] = payload.bypass_hours
-
     if not config.get("sheet_url") and not config.get("webhook_url"):
         raise HTTPException(400, "Please provide a Google Sheet URL or Apps Script Webhook URL.")
 

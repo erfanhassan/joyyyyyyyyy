@@ -1,10 +1,12 @@
 import logging
+import html
 import uuid
 from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.db.models import Order, Conversation, InteractionLog
@@ -50,8 +52,8 @@ async def handle_livekit_cloud_webhook(
     try:
         event = receiver.receive(body_str, auth_header)
     except Exception as e:
-        logger.warning(f"LiveKit Cloud webhook signature rejected: {e}")
-        raise HTTPException(401, f"Invalid LiveKit webhook token: {e}")
+        logger.warning("LiveKit Cloud webhook signature rejected.")
+        raise HTTPException(401, "Invalid LiveKit webhook token.") from None
 
     event_name = getattr(event, "event", "unknown")
     room_name = getattr(getattr(event, "room", None), "name", "")
@@ -112,12 +114,25 @@ async def handle_telephony_completion(
     if not order:
         raise HTTPException(404, "Callback does not match an existing order; no synthetic order was created.")
 
-    # 3. Update Order
-    order.status = new_status
-    order.call_transcript = payload.transcript
-    order.confirmation_channel = "voice"
-    if payload.updated_shipping_address:
-        order.shipping_address = payload.updated_shipping_address
+    # Claim the first confirmation atomically so a duplicate callback cannot create
+    # a second courier shipment.
+    first_confirmation = False
+    if new_status == "confirmed":
+        confirmation_update = await db.execute(
+            update(Order)
+            .where(Order.id == order.id, Order.tenant_id == payload.tenant_id, Order.status != "confirmed")
+            .values(status="confirmed", call_transcript=payload.transcript, confirmation_channel="voice",
+                    shipping_address=payload.updated_shipping_address or order.shipping_address)
+            .returning(Order.id)
+        )
+        first_confirmation = confirmation_update.scalar_one_or_none() is not None
+        await db.refresh(order)
+    else:
+        order.status = new_status
+        order.call_transcript = payload.transcript
+        order.confirmation_channel = "voice"
+        if payload.updated_shipping_address:
+            order.shipping_address = payload.updated_shipping_address
 
     # 4. Link/Update Conversation record for Operator Workbench
     if not order.conversation_id:
@@ -155,7 +170,7 @@ async def handle_telephony_completion(
 
     # 5. Delivery Partner Auto-Dispatch (Steadfast / Pathao)
     courier_result = None
-    if payload.order_confirmed:
+    if first_confirmation:
         try:
             from app.db.models import TenantIntegration
             from app.services.courier_service import CourierService
@@ -167,20 +182,23 @@ async def handle_telephony_completion(
             )
             int_res = await db.execute(int_stmt)
             courier_int = int_res.scalars().first()
-            courier_settings = courier_int.settings if courier_int else {}
-            courier_pref = courier_int.provider if courier_int else None
-
-            courier_result = await CourierService.dispatch_to_delivery_partner(
-                tenant_id=payload.tenant_id,
-                invoice=order.external_order_id,
-                recipient_name=order.customer_name,
-                recipient_phone=order.customer_phone,
-                recipient_address=order.shipping_address,
-                cod_amount=float(order.order_total),
-                courier_pref=courier_pref,
-                tenant_courier_settings=courier_settings,
-            )
-            logger.info(f"[Telephony Callback] Courier dispatch result: {courier_result}")
+            if courier_int:
+                from app.core.safety import open_credentials
+                courier_settings = open_credentials(courier_int.settings or {})
+                courier_pref = courier_settings.get("provider", courier_int.provider)
+                courier_result = await CourierService.dispatch_to_delivery_partner(
+                    tenant_id=payload.tenant_id,
+                    invoice=order.external_order_id,
+                    recipient_name=order.customer_name,
+                    recipient_phone=order.customer_phone,
+                    recipient_address=order.shipping_address,
+                    cod_amount=float(order.order_total),
+                    courier_pref=courier_pref,
+                    tenant_courier_settings=courier_settings,
+                )
+            else:
+                courier_result = {"status": "unconfigured", "message": "No active courier is configured."}
+            logger.info("Courier dispatch result status: %s.", (courier_result or {}).get("status", "unknown"))
         except Exception as e:
             logger.error(f"[Telephony Callback] Courier auto-dispatch error: {e}")
 
@@ -197,22 +215,53 @@ async def handle_telephony_completion(
         )
         sheet_res = await db.execute(sheet_stmt)
         sheet_int = sheet_res.scalars().first()
-        if sheet_int and sheet_int.settings.get("webhook_url"):
+        if sheet_int and sheet_int.settings:
+            from app.core.safety import open_credentials
+            sheet_settings = open_credentials(sheet_int.settings)
+        else:
+            sheet_settings = {}
+        if sheet_settings.get("webhook_url"):
             tracking = courier_result.get("tracking_code") if courier_result else None
             courier_name = courier_result.get("courier") if courier_result else None
             sheet_updated = await GoogleSheetsService.update_order_via_apps_script(
-                webhook_url=sheet_int.settings["webhook_url"],
+                webhook_url=sheet_settings["webhook_url"],
                 order_id=order.external_order_id,
                 status=new_status,
                 tracking_code=tracking,
                 courier=courier_name,
                 notes=f"Voice Confirmation Call: Confirmed={payload.order_confirmed}. {payload.transcript[:150]}",
             )
-            sheet_result = {"updated": sheet_updated, "webhook_url": sheet_int.settings["webhook_url"]}
+            sheet_result = {"updated": sheet_updated}
     except Exception as e:
         logger.error(f"[Telephony Callback] Google sheets sync error: {e}")
 
     # 7. Sync to Storefront (Shopify / WooCommerce)
+    storefront_url = None
+    storefront_token = None
+    try:
+        from app.db.models import TenantIntegration
+        from app.core.security import decrypt_token
+        from app.core.safety import open_credentials
+        store_stmt = select(TenantIntegration).where(
+            TenantIntegration.tenant_id == payload.tenant_id,
+            TenantIntegration.provider == order.storefront_provider,
+            TenantIntegration.is_active.is_(True),
+        )
+        store_int = (await db.execute(store_stmt)).scalars().first()
+        if store_int:
+            store_settings = open_credentials(store_int.settings or {})
+            storefront_token = decrypt_token(store_int.access_token_encrypted)
+            if order.storefront_provider == "shopify":
+                shop_domain = str(store_settings.get("shop_domain") or "").removeprefix("https://").rstrip("/")
+                storefront_url = f"https://{shop_domain}" if shop_domain else None
+            elif order.storefront_provider == "woocommerce":
+                storefront_url = store_settings.get("store_url")
+                consumer_key = store_settings.get("consumer_key")
+                if consumer_key:
+                    storefront_token = f"{consumer_key}:{storefront_token}"
+    except Exception as exc:
+        logger.warning("Could not load storefront credentials (%s).", type(exc).__name__)
+
     sync_result = await OrderSyncService.sync_order_status(
         tenant_id=payload.tenant_id,
         external_order_id=order.external_order_id,
@@ -220,6 +269,8 @@ async def handle_telephony_completion(
         new_status=new_status,
         transcript_summary=payload.transcript[:200],
         updated_address=payload.updated_shipping_address,
+        storefront_api_url=storefront_url,
+        access_token=storefront_token,
     )
 
     return {
@@ -240,93 +291,87 @@ async def verify_order_via_link(
     sig: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Public customer verification endpoint for omnichannel WhatsApp / SMS links.
-    Validates HMAC signature and timestamp expiry.
-    """
+    """Show a confirmation form only; link scanners must not mutate order state."""
     import time
-    import hmac
-    import hashlib
     from fastapi.responses import HTMLResponse
-    from app.core.config import settings
+    from app.agents.voice_confirmation import VoiceConfirmationAgent
 
-    # 1. Validate Expiry
-    now = int(time.time())
-    if now > exp:
-        return HTMLResponse(
-            status_code=400,
-            content="""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Link Expired</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f9fafb}.card{background:white;padding:32px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08);text-align:center;max-width:400px}h2{color:#b91c1c;margin-top:0}</style></head><body><div class="card"><h2>Link Expired</h2><p>This verification link has expired. Our support staff will contact you to confirm your order.</p></div></body></html>""",
-        )
-
-    # 2. Validate HMAC Signature
-    secret = settings.ENCRYPTION_KEY_SECRET
-    if len(secret) < 32:
-        raise HTTPException(503, "Secure order verification is not configured.")
-    expected_sig = hmac.new(secret.encode(), f"{order_id}:{exp}".encode(), hashlib.sha256).hexdigest()[:16]
-
-    if not hmac.compare_digest(sig, expected_sig):
-        return HTMLResponse(
-            status_code=403,
-            content="""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Invalid Signature</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f9fafb}.card{background:white;padding:32px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08);text-align:center;max-width:400px}h2{color:#b91c1c;margin-top:0}</style></head><body><div class="card"><h2>Invalid Verification Link</h2><p>This verification link is invalid or corrupted.</p></div></body></html>""",
-        )
-
-    # 3. Find and update order
+    if exp < int(time.time()) or exp > int(time.time()) + 86400:
+        return HTMLResponse(status_code=400, content="This order confirmation link has expired.")
+    if not VoiceConfirmationAgent.verify_signed_verification_link(order_id, tenant_id, exp, sig):
+        return HTMLResponse(status_code=403, content="This order confirmation link is invalid.")
     stmt = select(Order).where(Order.id == order_id, Order.tenant_id == tenant_id)
     res = await db.execute(stmt)
     order = res.scalars().first()
-
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-
-    order.status = "confirmed"
-    order.confirmation_channel = "whatsapp_link"
-    db.add(order)
-    await db.commit()
-
-    # 4. Sync status back to Shopify / WooCommerce
-    await OrderSyncService.sync_order_status(
-        tenant_id=tenant_id,
-        external_order_id=order.external_order_id,
-        storefront_provider=order.storefront_provider,
-        new_status="confirmed",
-        transcript_summary="Customer confirmed delivery via signed WhatsApp link.",
-        updated_address=order.shipping_address,
+    order_id_value = html.escape(str(order.external_order_id))
+    customer_name = html.escape(order.customer_name or "there")
+    total = html.escape(f"{order.order_total:,.2f}")
+    token_fields = (
+        f'<input type="hidden" name="order_id" value="{order.id}">'
+        f'<input type="hidden" name="tenant_id" value="{tenant_id}">'
+        f'<input type="hidden" name="exp" value="{exp}">'
+        f'<input type="hidden" name="sig" value="{html.escape(sig, quote=True)}">'
     )
-
-    return HTMLResponse(
+    if order.status == "confirmed":
+        content = f"<h1>Already confirmed</h1><p>Order #{order_id_value} has already been confirmed.</p>"
+    else:
+        content = (
+            f"<h1>Confirm your order</h1><p>Hello {customer_name}. "
+            f"Confirm order #{order_id_value} for BDT {total}.</p>"
+            f'<form method="post" action="/api/v1/telephony/verify-order/confirm">'
+            f'{token_fields}<button type="submit">Confirm order</button></form>'
+        )
+    response = HTMLResponse(
         status_code=200,
-        content=f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Order Confirmed | JOY</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f4f4f5; }}
-    .card {{ background: #ffffff; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); text-align: center; max-width: 440px; border: 1px solid #e4e4e7; }}
-    .badge {{ display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; border-radius: 28px; background: #ecfdf5; color: #059669; margin-bottom: 20px; }}
-    h1 {{ font-size: 20px; color: #18181b; margin: 0 0 8px 0; }}
-    p {{ font-size: 14px; color: #71717a; line-height: 1.5; margin: 0 0 20px 0; }}
-    .details {{ background: #fafafa; border: 1px solid #e4e4e7; border-radius: 10px; padding: 14px; text-align: left; font-size: 13px; color: #3f3f46; margin-bottom: 24px; }}
-    .row {{ display: flex; justify-content: space-between; margin-bottom: 6px; }}
-    .row:last-child {{ margin-bottom: 0; }}
-    .label {{ color: #71717a; }}
-    .value {{ font-weight: 600; color: #18181b; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="badge">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>
-    </div>
-    <h1>Order Confirmed!</h1>
-    <p>Thank you, {order.customer_name}. Your delivery has been verified and is now being prepared for shipping.</p>
-    <div class="details">
-      <div class="row"><span class="label">Order ID:</span><span class="value">#{order.external_order_id}</span></div>
-      <div class="row"><span class="label">Total:</span><span class="value">BDT {order.order_total:,.2f}</span></div>
-      <div class="row"><span class="label">Destination:</span><span class="value">{order.shipping_address}</span></div>
-    </div>
-  </div>
-</body>
-</html>""",
+        content=(
+            '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width, initial-scale=1"><title>Order confirmation | JOY</title>'
+            '<style>body{font:16px system-ui;background:#f4f4f5;display:grid;place-items:center;'
+            'min-height:100vh;margin:0}.card{background:white;padding:32px;border-radius:16px;'
+            'max-width:420px;box-shadow:0 8px 24px #0001}button{background:#111;color:#fff;border:0;'
+            'border-radius:8px;padding:12px 18px;font-size:16px;cursor:pointer}</style></head>'
+            f'<body><main class="card">{content}</main></body></html>'
+        ),
     )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@router.post("/verify-order/confirm")
+async def confirm_order_via_link(
+    order_id: UUID,
+    tenant_id: UUID,
+    exp: int,
+    sig: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Apply the signed customer confirmation only after an explicit POST."""
+    import time
+    from fastapi.responses import HTMLResponse
+    from app.agents.voice_confirmation import VoiceConfirmationAgent
+
+    if exp < int(time.time()) or exp > int(time.time()) + 86400:
+        return HTMLResponse(status_code=400, content="This order confirmation link has expired.")
+    if not VoiceConfirmationAgent.verify_signed_verification_link(order_id, tenant_id, exp, sig):
+        return HTMLResponse(status_code=403, content="This order confirmation link is invalid.")
+
+    stmt = select(Order).where(Order.id == order_id, Order.tenant_id == tenant_id)
+    order = (await db.execute(stmt)).scalars().first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status != "confirmed":
+        order.status = "confirmed"
+        order.confirmation_channel = "signed_link"
+        db.add(order)
+        await db.commit()
+
+    response = HTMLResponse(
+        status_code=200,
+        content=f"<h1>Order confirmed</h1><p>Thank you. Order #{html.escape(order.external_order_id)} is confirmed.</p>",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response

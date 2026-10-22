@@ -45,7 +45,12 @@ async def lifespan(app: FastAPI):
 
     # Auto-start LiveKit Voice Agent Worker process if credentials configured
     voice_worker_proc = None
-    if settings.LIVEKIT_URL and settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET:
+    if (
+        settings.LIVEKIT_URL
+        and settings.LIVEKIT_API_KEY
+        and settings.LIVEKIT_API_SECRET
+        and settings.OPENAI_API_KEY
+    ):
         try:
             worker_script = os.path.join(os.path.dirname(__file__), "agents", "livekit_voice_worker.py")
             if os.path.exists(worker_script):

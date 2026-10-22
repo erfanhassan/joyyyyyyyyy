@@ -91,23 +91,49 @@ class VoiceConfirmationAgent:
         import hmac
         import hashlib
         from app.core.config import settings
+        from app.core.public_urls import public_app_origin
 
         exp_ts = int(time.time()) + 86400  # 24 hours
-        secret = settings.ENCRYPTION_KEY_SECRET or "joy_order_verify_secret_2026"
-        sig = hmac.new(secret.encode(), f"{order_id}:{exp_ts}".encode(), hashlib.sha256).hexdigest()[:16]
+        secret = settings.ENCRYPTION_KEY_SECRET
+        if len(secret) < 32:
+            raise RuntimeError("Secure order verification is not configured.")
+        signed_value = f"{tenant_id}:{order_id}:{exp_ts}".encode()
+        sig = hmac.new(secret.encode(), signed_value, hashlib.sha256).hexdigest()
+        return (
+            f"{public_app_origin()}/api/v1/telephony/verify-order"
+            f"?order_id={order_id}&tenant_id={tenant_id}&exp={exp_ts}&sig={sig}"
+        )
 
-        domain = getattr(settings, "DOMAIN", None) or "joy.sonictch.com"
-        if not domain.startswith("http://") and not domain.startswith("https://"):
-            domain = f"https://{domain}"
+    @staticmethod
+    def verify_signed_verification_link(order_id: UUID, tenant_id: UUID, exp: int, sig: str) -> bool:
+        import hmac
+        import hashlib
+        from app.core.config import settings
 
-        return f"{domain}/api/v1/telephony/verify-order?order_id={order_id}&tenant_id={tenant_id}&exp={exp_ts}&sig={sig}"
+        secret = settings.ENCRYPTION_KEY_SECRET
+        if len(secret) < 32:
+            return False
+        current = hmac.new(
+            secret.encode(),
+            f"{tenant_id}:{order_id}:{exp}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(sig, current):
+            return True
+        # Allow old links generated before the tenant ID and full-length signature fix.
+        legacy = hmac.new(
+            secret.encode(),
+            f"{order_id}:{exp}".encode(),
+            hashlib.sha256,
+        ).hexdigest()[:16]
+        return hmac.compare_digest(sig, legacy)
 
     @staticmethod
     async def process_order_confirmation(
         order_id: UUID,
         tenant_id: UUID,
         db: AsyncSession,
-        bypass_timezone_for_test: bool = False,
+        order_items: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes order verification pipeline for an incoming order:
@@ -133,11 +159,13 @@ class VoiceConfirmationAgent:
         )
         cfg_res = await db.execute(cfg_stmt)
         agent_cfg = cfg_res.scalars().first()
-        merchant_hours = agent_cfg.operational_hours if agent_cfg else None
+        if not agent_cfg or not agent_cfg.is_active:
+            return {"status": "agent_disabled", "message": "Voice confirmation is not enabled for this workspace."}
+        merchant_hours = agent_cfg.operational_hours
 
         # 3. Timezone & Operating Hours Validation
         allowed, reason = is_within_calling_hours(order.customer_phone, merchant_hours)
-        if not allowed and not bypass_timezone_for_test:
+        if not allowed:
             logger.info(f"Order {order_id} call held: {reason}. Triggering Omnichannel Fallback.")
             verification_link = VoiceConfirmationAgent.generate_signed_verification_link(order.id, tenant_id)
 
@@ -148,8 +176,8 @@ class VoiceConfirmationAgent:
             await db.commit()
 
             return {
-                "status": "fallback_dispatched",
-                "channel": "whatsapp",
+                "status": "verification_link_created",
+                "channel": "not_sent",
                 "reason": reason,
                 "verification_link": verification_link,
             }
@@ -160,7 +188,7 @@ class VoiceConfirmationAgent:
             if r:
                 lock_key = f"lock:telephony:call:{order_id}"
                 acquired = await r.set(lock_key, "locked", ex=300, nx=True)
-                if not acquired and not bypass_timezone_for_test:
+                if not acquired:
                     logger.warning(f"Outbound call already in progress for order {order_id}")
                     return {"status": "skipped", "message": "Call currently in progress"}
         except Exception as e:
@@ -177,21 +205,23 @@ class VoiceConfirmationAgent:
                 customer_phone=order.customer_phone,
                 customer_name=order.customer_name,
                 shipping_address=order.shipping_address,
-                order_items=f"Store Order #{order.external_order_id}",
+                order_items=order_items or f"Store Order #{order.external_order_id}",
                 order_total=float(order.order_total),
                 tenant_id=tenant_id,
             )
             return {
                 "status": "call_dispatched",
                 "order_id": str(order.id),
-                "customer_phone": order.customer_phone,
                 "call_id": call_result.get("call_id"),
                 "room_name": call_result.get("room_name"),
                 "reason": reason,
             }
         except OutboundCallingUnavailable as exc:
-            logger.warning(f"Telephony unavailable ({exc}). Engaging signed WhatsApp fallback.")
-            verification_link = VoiceConfirmationAgent.generate_signed_verification_link(order.id, tenant_id)
+            logger.warning("Telephony unavailable (%s).", type(exc).__name__)
+            try:
+                verification_link = VoiceConfirmationAgent.generate_signed_verification_link(order.id, tenant_id)
+            except RuntimeError:
+                return {"status": "not_dispatched", "message": "Telephony and secure confirmation-link delivery are not configured."}
             order.confirmation_channel = "whatsapp"
             order.fallback_status = "telephony_unavailable_fallback"
             order.fallback_dispatched_at = datetime.now(timezone.utc)
@@ -199,8 +229,8 @@ class VoiceConfirmationAgent:
             await db.commit()
 
             return {
-                "status": "fallback_dispatched",
-                "channel": "whatsapp",
-                "reason": str(exc),
+                "status": "verification_link_created",
+                "channel": "not_sent",
+                "reason": "Telephony is unavailable; a signed link was created but not delivered.",
                 "verification_link": verification_link,
             }

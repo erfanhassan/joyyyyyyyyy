@@ -12,6 +12,7 @@ import dotenv
 dotenv.load_dotenv()
 
 from app.core.config import settings
+from app.core.public_urls import public_app_origin
 
 # Ensure critical environment variables are propagated to os.environ for livekit-agents C-bindings
 if settings.LIVEKIT_URL:
@@ -49,9 +50,7 @@ async def post_telephony_completion(
     updated_shipping_address: Optional[str] = None,
 ):
     """Dispatches cryptographically signed completion payload to JOY telephony webhook."""
-    domain = settings.DOMAIN or "joy.sonictch.com"
-    proto = "https" if "sonictch" in domain else "http"
-    url = f"{proto}://{domain}/api/v1/webhooks/telephony/completion"
+    url = f"{public_app_origin()}/api/v1/webhooks/telephony/completion"
 
     payload_dict = {
         "order_id": order_id,
@@ -75,7 +74,7 @@ async def post_telephony_completion(
         "x-joy-signature": signature,
     }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False, trust_env=False) as client:
         try:
             resp = await client.post(url, headers=headers, content=body_bytes)
             logger.info(f"[Voice Worker] Posted call completion for order {order_id}: {resp.status_code}")
