@@ -262,6 +262,7 @@ export default function IntegrationHubPage() {
         setMetaModalOpen(false);
         setMetaDiscoveredPages([]);
         loadIntegrations();
+        window.dispatchEvent(new Event("joy:integrations-updated"));
       } else {
         alert(data.detail || "Failed to connect selected page.");
       }
@@ -327,6 +328,7 @@ export default function IntegrationHubPage() {
         setMetaModalOpen(false);
         setMetaToken("");
         loadIntegrations();
+        window.dispatchEvent(new Event("joy:integrations-updated"));
       }
     } catch (err: any) {
       alert("Connection error: " + err.message);
@@ -432,6 +434,10 @@ export default function IntegrationHubPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Provider verification failed.");
       setDiagnostics((prev) => ({ ...prev, [provider]: data }));
+      if (provider === "meta" && data.status === "healthy") {
+        await loadIntegrations();
+        window.dispatchEvent(new Event("joy:integrations-updated"));
+      }
     } catch (err: any) {
       setDiagnostics((prev) => ({ ...prev, [provider]: { status: "error", message: err.message } }));
     }

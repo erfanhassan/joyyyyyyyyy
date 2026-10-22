@@ -86,6 +86,7 @@ export function WhatsAppConnection({ metaAppId, signupConfigId }: WhatsAppConnec
         setPhone(assets.phone_number_id);
         await reload();
         await refetchTenant();
+        window.dispatchEvent(new Event("joy:integrations-updated"));
         setNotice(data.message || "WhatsApp was connected. Live webhook delivery still needs testing.");
       } catch (error) {
         setNotice(error instanceof Error ? error.message : "WhatsApp signup could not be verified.");

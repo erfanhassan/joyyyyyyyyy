@@ -85,10 +85,14 @@ class WhatsAppService:
     async def approved_templates(db, tenant_id):
         record = await WhatsAppService.integration(db, tenant_id)
         token = decrypt_token(record.access_token_encrypted)
-        templates = await WhatsAppService.api(
-            token, "GET", f"{record.settings['waba_id']}/message_templates",
-            params={"fields": "name,status,language,category,components", "limit": 100},
-        )
+        try:
+            templates = await WhatsAppService.api(
+                token, "GET", f"{record.settings['waba_id']}/message_templates",
+                params={"fields": "name,status,language,category,components", "limit": 100},
+            )
+        except MetaCredentialError as error:
+            mark_reconnect_required(record, error.channel)
+            raise
         return [
             {
                 "name": item["name"],

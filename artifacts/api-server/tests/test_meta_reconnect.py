@@ -1,6 +1,7 @@
 """Meta credential failures stop automatic delivery and expose safe recovery state."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from app.services.meta_api import MetaAPIClient
 from app.services.meta_credentials import (
     MetaCredentialError,
+    clear_reconnect_required,
     credential_error,
     mark_reconnect_required,
 )
@@ -78,6 +80,72 @@ def test_reconnect_state_is_safe_and_idempotent():
     assert integration.settings["attention_channel"] == "Instagram"
     assert integration.settings["attention_detected_at"] == first_detected_at
     assert integration.settings["page_id"] == "123"
+
+
+def test_successful_reconnect_clears_only_recovery_metadata():
+    integration = SimpleNamespace(settings={
+        "page_id": "123",
+        "page_name": "Store",
+        "connection_status": "needs_reconnect",
+        "attention_channel": "Instagram",
+        "attention_reason": "credentials_expired_or_permissions_revoked",
+        "attention_detected_at": "2026-10-22T00:00:00+00:00",
+    })
+
+    assert clear_reconnect_required(integration) is True
+    assert integration.settings == {"page_id": "123", "page_name": "Store"}
+    assert clear_reconnect_required(integration) is False
+
+
+@pytest.mark.asyncio
+async def test_reconnect_notice_endpoint_is_owner_scoped_and_credential_free(monkeypatch):
+    from app.api.routes import tenant as routes
+
+    tenant_id = uuid4()
+    integration = SimpleNamespace(
+        id=uuid4(),
+        provider="meta",
+        is_active=True,
+        settings={
+            "connection_status": "needs_reconnect",
+            "attention_channel": "Instagram",
+            "access_token": "must-not-be-returned",
+        },
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [integration]),
+    )))
+    monkeypatch.setattr(
+        "app.services.workspaces.workspace_for",
+        AsyncMock(return_value=(SimpleNamespace(id=tenant_id), "owner")),
+    )
+
+    result = await routes.list_reconnect_notices(tenant_id, SimpleNamespace(), db)
+
+    assert result == {"notifications": [{
+        "id": str(integration.id),
+        "provider": "meta",
+        "channel": "Instagram",
+    }]}
+    assert "must-not-be-returned" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_notice_endpoint_rejects_non_owners(monkeypatch):
+    from app.api.routes import tenant as routes
+    from fastapi import HTTPException
+
+    tenant_id = uuid4()
+    db = SimpleNamespace()
+    monkeypatch.setattr(
+        "app.services.workspaces.workspace_for",
+        AsyncMock(return_value=(SimpleNamespace(id=tenant_id), "operator")),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await routes.list_reconnect_notices(tenant_id, SimpleNamespace(), db)
+
+    assert error.value.status_code == 403
 
 
 @pytest.mark.asyncio

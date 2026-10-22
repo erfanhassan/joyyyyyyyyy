@@ -448,8 +448,12 @@ async def list_whatsapp_templates(
     if not conversation:
         raise HTTPException(404, "WhatsApp conversation not found.")
     from app.services.whatsapp import WhatsAppService
+    from app.services.meta_credentials import MetaCredentialError
     try:
         templates = await WhatsAppService.approved_templates(db, tenant_id)
+    except MetaCredentialError as error:
+        await db.commit()
+        raise HTTPException(502, str(error)) from None
     except Exception as error:
         raise HTTPException(502, str(error)) from None
     return {"templates": templates}
@@ -470,6 +474,7 @@ async def send_whatsapp_template(
         raise HTTPException(404, "WhatsApp conversation not found.")
 
     from app.services.whatsapp import WhatsAppService
+    from app.services.meta_credentials import MetaCredentialError
     try:
         result, template = await WhatsAppService.send_template(
             db, conversation, req.name, req.language, req.variables)
@@ -477,6 +482,9 @@ async def send_whatsapp_template(
         raise HTTPException(403, str(error)) from None
     except ValueError as error:
         raise HTTPException(400, str(error)) from None
+    except MetaCredentialError as error:
+        await db.commit()
+        raise HTTPException(502, str(error)) from None
     except Exception as error:
         raise HTTPException(502, str(error)) from None
 

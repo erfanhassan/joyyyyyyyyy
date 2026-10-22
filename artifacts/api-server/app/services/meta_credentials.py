@@ -49,3 +49,19 @@ def mark_reconnect_required(integration, channel: str) -> None:
         "attention_detected_at": datetime.now(timezone.utc).isoformat(),
     })
     integration.settings = settings
+
+
+def clear_reconnect_required(integration) -> bool:
+    """Remove recovery metadata after a verified connection succeeds."""
+    settings: Dict[str, Any] = dict(integration.settings or {})
+    if settings.get("connection_status") != "needs_reconnect":
+        return False
+    for key in (
+        "connection_status",
+        "attention_channel",
+        "attention_reason",
+        "attention_detected_at",
+    ):
+        settings.pop(key, None)
+    integration.settings = settings
+    return True

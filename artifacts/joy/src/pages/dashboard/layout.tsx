@@ -19,6 +19,7 @@ import {
   X
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
+import { MetaReconnectNotice } from "@/components/meta-reconnect-notice";
 
 const STEPS = [
   {
@@ -229,6 +230,7 @@ export default function DashboardLayout({
 
       {/* Main Content Area */}
       <main className="max-w-7xl mx-auto px-6 py-8">
+        {tenant?.role === "owner" && <MetaReconnectNotice tenantId={tenantId} />}
         {children}
       </main>
 

@@ -11,7 +11,11 @@ from app.db.models import Tenant, TenantIntegration, Order, User
 from app.core.security import encrypt_token, decrypt_token
 from app.core.config import settings
 from app.services.telephony_service import TelephonyService, OutboundCallingUnavailable
-from app.services.meta_credentials import MetaCredentialError, mark_reconnect_required
+from app.services.meta_credentials import (
+    MetaCredentialError,
+    clear_reconnect_required,
+    mark_reconnect_required,
+)
 import httpx
 import time
 
@@ -285,6 +289,42 @@ async def list_tenant_integrations(tenant_id: UUID, db: AsyncSession = Depends(g
         })
 
     return {"tenant_id": str(tenant_id), "integrations": items}
+
+
+@router.get("/{tenant_id}/reconnect-notices")
+async def list_reconnect_notices(
+    tenant_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return safe Meta reconnect notices to the owning workspace account only."""
+    from app.services.workspaces import workspace_for
+
+    tenant, role = await workspace_for(request, db)
+    if tenant.id != tenant_id or role != "owner":
+        raise HTTPException(status_code=403, detail="Only this workspace's owner can view reconnect notices.")
+
+    result = await db.execute(select(TenantIntegration).where(
+        TenantIntegration.tenant_id == tenant.id,
+        TenantIntegration.provider.in_(("meta", "whatsapp")),
+        TenantIntegration.is_active.is_(True),
+    ))
+    notices = []
+    for integration in result.scalars().all():
+        integration_settings = integration.settings or {}
+        if integration_settings.get("connection_status") != "needs_reconnect":
+            continue
+        notices.append({
+            "id": str(integration.id),
+            "provider": integration.provider,
+            "channel": integration_settings.get("attention_channel")
+                if integration_settings.get("attention_channel") in {
+                    "Facebook Page", "Instagram", "WhatsApp"
+                }
+                else ("WhatsApp" if integration.provider == "whatsapp" else "Facebook Page"),
+        })
+
+    return {"notifications": notices}
 
 
 @router.post("/{tenant_id}/integrations")
@@ -708,6 +748,8 @@ async def test_integration_connection(
             }
         except HTTPException as exc:
             return {"status": "error", "provider": "meta", "connected": False, "message": exc.detail}
+        if clear_reconnect_required(integration):
+            await db.commit()
         latency = max(1, int((time.monotonic() - t0) * 1000))
 
         return {
