@@ -71,6 +71,10 @@ class TelephonyService:
             raise OutboundCallingUnavailable("LiveKit Cloud credentials (URL, API Key, API Secret) are not configured.")
         if not (settings.TELEPHONY_PHONE_NUMBER):
             raise OutboundCallingUnavailable("Telephony phone number is not configured.")
+        if not settings.LIVEKIT_SIP_TRUNK_ID:
+            raise OutboundCallingUnavailable("LiveKit SIP outbound trunk ID is not configured.")
+        if not settings.OPENAI_API_KEY:
+            raise OutboundCallingUnavailable("OpenAI voice processing is not configured.")
 
     @staticmethod
     async def test_telephony_status() -> Dict[str, Any]:
@@ -191,8 +195,7 @@ class TelephonyService:
         Initiates outbound AI phone confirmation call via LiveKit SIP trunk.
         Provisions a LiveKit room with order context metadata and dispatches SIP dialing.
         """
-        if not settings.LIVEKIT_URL or not settings.LIVEKIT_API_KEY or not settings.LIVEKIT_API_SECRET:
-            raise OutboundCallingUnavailable("LiveKit credentials (URL, API Key, API Secret) are not configured.")
+        TelephonyService.require_outbound_calling()
 
         room_name = f"order-call-{order_id}"
         livekit_url = settings.LIVEKIT_URL.replace("wss://", "https://").replace("ws://", "http://")
@@ -234,7 +237,8 @@ class TelephonyService:
                     },
                 )
                 if room_resp.status_code != 200:
-                    logger.error(f"LiveKit CreateRoom returned {room_resp.status_code}: {room_resp.text}")
+                    logger.error("LiveKit CreateRoom returned HTTP %s.", room_resp.status_code)
+                    raise OutboundCallingUnavailable("LiveKit could not create a call room.")
             except Exception as e:
                 if isinstance(e, OutboundCallingUnavailable):
                     raise
@@ -258,12 +262,16 @@ class TelephonyService:
                 if agent_dispatch_resp.status_code == 200:
                     logger.info(f"Dispatched AI Agent 'joy-voice-agent' to room {room_name}")
                 else:
-                    logger.warning(f"Agent dispatch returned status {agent_dispatch_resp.status_code}: {agent_dispatch_resp.text}")
+                    logger.error("LiveKit agent dispatch returned HTTP %s.", agent_dispatch_resp.status_code)
+                    raise OutboundCallingUnavailable("The voice agent could not be dispatched; no phone call was placed.")
             except Exception as e:
+                if isinstance(e, OutboundCallingUnavailable):
+                    raise
                 logger.warning(f"Could not dispatch agent via AgentDispatchService: {e}")
+                raise OutboundCallingUnavailable("The voice agent could not be dispatched; no phone call was placed.") from None
 
             # 3. Create SIP Outbound Participant
-            trunk_id = getattr(settings, "LIVEKIT_SIP_TRUNK_ID", "") or "ST_vVLQdDP44uVL"
+            trunk_id = settings.LIVEKIT_SIP_TRUNK_ID
             sip_call_id = f"sip_{order_id}"
             try:
                 sip_resp = await client.post(

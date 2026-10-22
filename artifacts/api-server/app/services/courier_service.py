@@ -31,13 +31,6 @@ class CourierService:
                     "provider": "steadfast",
                     "message": "Steadfast Api-Key and Secret-Key are required.",
                 }
-            if "test" in api_key.lower() or "demo" in api_key.lower():
-                return {
-                    "connected": True,
-                    "provider": "steadfast",
-                    "sandbox": True,
-                    "message": "Steadfast Sandbox/Test credentials validated successfully.",
-                }
             base_url = settings.STEADFAST_BASE_URL.rstrip("/")
             endpoint = f"{base_url}/get_balance"
             try:
@@ -58,13 +51,13 @@ class CourierService:
                             "connected": False,
                             "provider": "steadfast",
                             "status_code": resp.status_code,
-                            "message": f"Steadfast verification failed (HTTP {resp.status_code}): {resp.text}",
+                            "message": f"Steadfast verification failed (HTTP {resp.status_code}).",
                         }
             except Exception as e:
                 return {
                     "connected": False,
                     "provider": "steadfast",
-                    "message": f"Connection error checking Steadfast: {e}",
+                    "message": "Could not reach Steadfast. Check the server connection and credentials.",
                 }
 
         elif prov == "pathao":
@@ -77,13 +70,6 @@ class CourierService:
                     "connected": False,
                     "provider": "pathao",
                     "message": "Pathao Client ID, Client Secret, Username, and Password are all required.",
-                }
-            if "test" in str(client_id).lower() or "demo" in str(client_id).lower():
-                return {
-                    "connected": True,
-                    "provider": "pathao",
-                    "sandbox": True,
-                    "message": "Pathao Sandbox/Test credentials validated successfully.",
                 }
             base_url = settings.PATHAO_BASE_URL.rstrip("/")
             endpoint = f"{base_url}/aladdin/api/v1/issue-token"
@@ -110,13 +96,13 @@ class CourierService:
                             "connected": False,
                             "provider": "pathao",
                             "status_code": resp.status_code,
-                            "message": f"Pathao auth failed (HTTP {resp.status_code}): {resp.text}",
+                            "message": f"Pathao authentication failed (HTTP {resp.status_code}).",
                         }
             except Exception as e:
                 return {
                     "connected": False,
                     "provider": "pathao",
-                    "message": f"Connection error checking Pathao: {e}",
+                    "message": "Could not reach Pathao. Check the server connection and credentials.",
                 }
 
         return {
@@ -159,7 +145,10 @@ class CourierService:
         async with httpx.AsyncClient(timeout=12.0) as client:
             try:
                 resp = await client.post(endpoint, headers=headers, json=payload)
-                data = resp.json() if resp.status_code < 500 else {"text": resp.text}
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        data = {}
                 if resp.status_code in (200, 201) and (data.get("status") == 200 or data.get("consignment")):
                     consignment = data.get("consignment", {})
                     tracking_code = consignment.get("tracking_code") or data.get("tracking_code") or f"STDF-{invoice}"
@@ -175,12 +164,12 @@ class CourierService:
                     return {
                         "success": False,
                         "courier": "steadfast",
-                        "error": data.get("message") or resp.text,
+                        "error": data.get("message") or f"Courier rejected the request (HTTP {resp.status_code}).",
                         "status_code": resp.status_code,
                     }
             except Exception as e:
                 logger.error(f"Failed to communicate with Steadfast Courier: {e}")
-                return {"success": False, "courier": "steadfast", "error": str(e)}
+                return {"success": False, "courier": "steadfast", "error": "Courier request failed."}
 
     @staticmethod
     async def create_pathao_parcel(
@@ -220,8 +209,8 @@ class CourierService:
                     },
                 )
                 if auth_resp.status_code != 200:
-                    logger.warning(f"Pathao Auth failed: {auth_resp.text}")
-                    return {"success": False, "courier": "pathao", "error": f"Pathao Auth failed: {auth_resp.text}"}
+                    logger.warning("Pathao authentication failed with HTTP %s.", auth_resp.status_code)
+                    return {"success": False, "courier": "pathao", "error": "Pathao authentication failed."}
 
                 token = auth_resp.json().get("access_token")
                 if not token:
@@ -251,7 +240,10 @@ class CourierService:
                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                     json=order_payload,
                 )
-                data = order_resp.json() if order_resp.status_code < 500 else {"text": order_resp.text}
+                try:
+                    data = order_resp.json()
+                except ValueError:
+                    data = {}
                 if order_resp.status_code in (200, 201) and data.get("data"):
                     order_data = data.get("data", {})
                     consignment_id = order_data.get("consignment_id")
@@ -266,12 +258,12 @@ class CourierService:
                     return {
                         "success": False,
                         "courier": "pathao",
-                        "error": data.get("message") or order_resp.text,
+                        "error": data.get("message") or f"Courier rejected the request (HTTP {order_resp.status_code}).",
                         "status_code": order_resp.status_code,
                     }
             except Exception as e:
                 logger.error(f"Pathao dispatch error: {e}")
-                return {"success": False, "courier": "pathao", "error": str(e)}
+                return {"success": False, "courier": "pathao", "error": "Courier request failed."}
 
     @staticmethod
     async def dispatch_to_delivery_partner(
@@ -286,14 +278,20 @@ class CourierService:
     ) -> Dict[str, Any]:
         """
         Auto-selects configured courier (Steadfast or Pathao) and creates consignment.
-        Falls back to global or sandbox mock tracking if keys are in test mode.
+        Does not simulate a live consignment when credentials are absent.
         """
         cfg = tenant_courier_settings or {}
-        provider = courier_pref or cfg.get("provider") or ("steadfast" if settings.STEADFAST_API_KEY else "pathao")
+        provider = courier_pref or cfg.get("provider")
+        if provider not in ("steadfast", "pathao"):
+            return {
+                "success": False,
+                "status": "unconfigured",
+                "error": "No supported courier is configured for this workspace.",
+            }
 
         if provider == "steadfast":
-            api_key = cfg.get("api_key") or settings.STEADFAST_API_KEY
-            secret_key = cfg.get("secret_key") or settings.STEADFAST_SECRET_KEY
+            api_key = cfg.get("api_key")
+            secret_key = cfg.get("secret_key")
             if api_key and secret_key:
                 return await CourierService.create_steadfast_parcel(
                     api_key=api_key,
@@ -304,24 +302,18 @@ class CourierService:
                     recipient_address=recipient_address,
                     cod_amount=cod_amount,
                 )
-            else:
-                # Return simulated tracking code for development/demo test mode
-                tracking = f"STDF-DEMO-{invoice.upper()}"
-                logger.info(f"[Steadfast Courier Demo] Generated consignment {tracking} for {recipient_name}")
-                return {
-                    "success": True,
-                    "courier": "steadfast",
-                    "consignment_id": f"CS_{invoice}",
-                    "tracking_code": tracking,
-                    "simulated": True,
-                    "note": "Steadfast API keys not configured. Generated test consignment tracking code.",
-                }
+            return {
+                "success": False,
+                "status": "unconfigured",
+                "courier": "steadfast",
+                "error": "Steadfast credentials are not configured for this workspace.",
+            }
 
         elif provider == "pathao":
-            client_id = cfg.get("client_id") or settings.PATHAO_CLIENT_ID
-            client_secret = cfg.get("client_secret") or settings.PATHAO_CLIENT_SECRET
-            username = cfg.get("username") or settings.PATHAO_USERNAME
-            password = cfg.get("password") or settings.PATHAO_PASSWORD
+            client_id = cfg.get("client_id")
+            client_secret = cfg.get("client_secret")
+            username = cfg.get("username")
+            password = cfg.get("password")
             store_id = cfg.get("store_id") or 1
             if client_id and client_secret and username and password:
                 return await CourierService.create_pathao_parcel(
@@ -336,17 +328,12 @@ class CourierService:
                     recipient_address=recipient_address,
                     cod_amount=cod_amount,
                 )
-            else:
-                tracking = f"PTH-DEMO-{invoice.upper()}"
-                logger.info(f"[Pathao Courier Demo] Generated consignment {tracking} for {recipient_name}")
-                return {
-                    "success": True,
-                    "courier": "pathao",
-                    "consignment_id": f"CS_{invoice}",
-                    "tracking_code": tracking,
-                    "simulated": True,
-                    "note": "Pathao API keys not configured. Generated test consignment tracking code.",
-                }
+            return {
+                "success": False,
+                "status": "unconfigured",
+                "courier": "pathao",
+                "error": "Pathao credentials are not configured for this workspace.",
+            }
 
         return {
             "success": False,

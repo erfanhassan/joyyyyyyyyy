@@ -15,9 +15,8 @@ class Settings(BaseSettings):
     MAX_CRAWL_BYTES: int = 2 * 1024 * 1024
     MAX_DOCUMENT_CHUNKS: int = 500
     SHOPIFY_API_VERSION: str = "2026-07"
-    DOMAIN: str = "joy.sonictch.com"
-    CUSTOM_DOMAINS: str = "joy.sonictch.com"
-    REPLIT_DOMAINS: str = "joy.sonictch.com,localhost,127.0.0.1"
+    DOMAIN: str = "https://joy.sonictech.com"
+    CUSTOM_DOMAINS: str = "joy.sonictech.com"
     
     # CORS Origins
     BACKEND_CORS_ORIGINS: List[str] = [
@@ -27,8 +26,8 @@ class Settings(BaseSettings):
         "http://127.0.0.1:8000",
         "http://localhost:8080",
         "http://127.0.0.1:8080",
-        "https://joy.sonictch.com",
-        "http://joy.sonictch.com",
+        "https://joy.sonictech.com",
+        "http://joy.sonictech.com",
     ]
 
     # Database & Cache
@@ -50,7 +49,7 @@ class Settings(BaseSettings):
     LIVEKIT_LLM_MODEL: str = "deepseek-ai/deepseek-v3"
     LIVEKIT_TTS_MODEL: str = "openai/tts-1"
     OPENAI_VOICE: str = "alloy"
-    LIVEKIT_SIP_TRUNK_ID: str = "ST_vVLQdDP44uVL"
+    LIVEKIT_SIP_TRUNK_ID: str = ""
     SIP_TRUNK_PROVIDER: str = "AmberIT"
     AMBERIT_SIP_SERVER: str = ""
     AMBERIT_EXTENSION: str = ""

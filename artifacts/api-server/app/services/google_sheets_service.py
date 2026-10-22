@@ -2,11 +2,15 @@ import logging
 import csv
 import io
 import json
+import re
 import httpx
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 from datetime import datetime, timezone
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from app.core.config import settings
+from app.core.safety import PublicTransport, public_url
 
 logger = logging.getLogger("joy.google_sheets")
 
@@ -22,12 +26,42 @@ class GoogleSheetsService:
 
     @staticmethod
     def extract_sheet_id_from_url(url_or_id: str) -> str:
-        """Extracts the 44-character spreadsheet ID from a full Google Sheets URL or raw ID."""
+        """Extracts and validates a Google spreadsheet ID or canonical Sheets URL."""
         cleaned = url_or_id.strip()
-        if "/d/" in cleaned:
-            parts = cleaned.split("/d/")[1]
-            return parts.split("/")[0]
+        if "://" in cleaned:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(cleaned)
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname != "docs.google.com"
+                or not parsed.path.startswith("/spreadsheets/d/")
+            ):
+                raise ValueError("Use a Google Sheets URL from docs.google.com.")
+            cleaned = parsed.path.split("/spreadsheets/d/", 1)[1].split("/", 1)[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", cleaned):
+            raise ValueError("The Google Sheets spreadsheet ID is invalid.")
         return cleaned
+
+    @staticmethod
+    async def _apps_script_client():
+        return httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            trust_env=False,
+            transport=PublicTransport(),
+        )
+
+    @staticmethod
+    async def _validate_apps_script_url(webhook_url: str) -> None:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(webhook_url)
+        if (
+            parsed.hostname != "script.google.com"
+            or not parsed.path.startswith("/macros/s/")
+            or not parsed.path.endswith("/exec")
+        ):
+            raise ValueError("Use a deployed Google Apps Script web app URL.")
+        await public_url(webhook_url)
 
     @staticmethod
     async def fetch_orders_via_apps_script(webhook_url: str) -> List[Dict[str, Any]]:
@@ -35,19 +69,22 @@ class GoogleSheetsService:
         Fetches orders from merchant's Google Apps Script Webhook:
         GET {webhook_url}?action=get_pending_orders
         """
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        await GoogleSheetsService._validate_apps_script_url(webhook_url)
+        async with await GoogleSheetsService._apps_script_client() as client:
             try:
                 resp = await client.get(webhook_url, params={"action": "get_pending_orders"})
                 if resp.status_code == 200:
                     data = resp.json()
                     orders = data.get("orders") or (data if isinstance(data, list) else [])
-                    return orders
+                    return orders if isinstance(orders, list) else []
                 else:
-                    logger.warning(f"Apps script returned {resp.status_code}: {resp.text}")
-                    return []
+                    logger.warning("Apps Script returned HTTP %s.", resp.status_code)
+                    raise RuntimeError(f"Google Apps Script returned HTTP {resp.status_code}.")
             except Exception as e:
-                logger.error(f"Error fetching from Google Apps Script webhook: {e}")
-                return []
+                if isinstance(e, (ValueError, RuntimeError)):
+                    raise
+                logger.error("Error fetching from Google Apps Script (%s).", type(e).__name__)
+                raise RuntimeError("Could not read the Google Apps Script endpoint.") from None
 
     @staticmethod
     async def update_order_via_apps_script(
@@ -70,12 +107,16 @@ class GoogleSheetsService:
             "courier": courier or "",
             "notes": notes or f"Call completed on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         }
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        await GoogleSheetsService._validate_apps_script_url(webhook_url)
+        async with await GoogleSheetsService._apps_script_client() as client:
             try:
                 resp = await client.post(webhook_url, json=payload)
-                return resp.status_code in (200, 201)
+                if resp.status_code not in (200, 201):
+                    logger.warning("Apps Script update returned HTTP %s.", resp.status_code)
+                    return False
+                return True
             except Exception as e:
-                logger.error(f"Failed to update sheet via Apps Script: {e}")
+                logger.error("Failed to update sheet via Apps Script (%s).", type(e).__name__)
                 return False
 
     @staticmethod
@@ -84,13 +125,21 @@ class GoogleSheetsService:
         Reads pending orders from a published or shareable Google Sheet CSV export link:
         https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}
         """
+        sheet_id = GoogleSheetsService.extract_sheet_id_from_url(sheet_id)
+        if not re.fullmatch(r"[0-9]{1,20}", str(gid)):
+            raise ValueError("The sheet tab ID is invalid.")
         url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            trust_env=False,
+            transport=PublicTransport(),
+        ) as client:
             try:
                 resp = await client.get(url)
                 if resp.status_code != 200:
-                    logger.warning(f"Could not read Google Sheet CSV ({resp.status_code})")
-                    return []
+                    logger.warning("Could not read Google Sheet CSV (HTTP %s).", resp.status_code)
+                    raise RuntimeError(f"Google Sheets CSV export returned HTTP {resp.status_code}.")
 
                 content = resp.text
                 reader = csv.DictReader(io.StringIO(content))
@@ -124,8 +173,10 @@ class GoogleSheetsService:
                         })
                 return orders
             except Exception as e:
-                logger.error(f"Error fetching Google Sheet CSV: {e}")
-                return []
+                if isinstance(e, (ValueError, RuntimeError)):
+                    raise
+                logger.error("Error fetching Google Sheet CSV (%s).", type(e).__name__)
+                raise RuntimeError("Could not read the Google Sheets CSV export.") from None
 
     @staticmethod
     async def sync_and_dispatch_pending_orders(
@@ -186,14 +237,17 @@ class GoogleSheetsService:
                 order_id=order.id,
                 tenant_id=tenant_id,
                 db=db_session,
-                bypass_timezone_for_test=sheet_config.get("bypass_hours", False),
+                order_items=str(item.get("order_items") or item.get("items") or item.get("product") or "Order items"),
             )
-            dispatched_count += 1
+            dispatch_status = call_res.get("status")
+            if dispatch_status == "call_dispatched":
+                dispatched_count += 1
+            elif dispatch_status == "fallback_dispatched":
+                fallback_count += 1
             results.append({
                 "order_id": str(order.id),
                 "external_order_id": order.external_order_id,
-                "phone": phone,
-                "dispatch_status": call_res.get("status"),
+                "dispatch_status": dispatch_status,
                 "room_name": call_res.get("room_name"),
             })
 
@@ -202,5 +256,7 @@ class GoogleSheetsService:
             "total_found": len(orders_to_process),
             "pending_count": len(pending),
             "dispatched_count": dispatched_count,
+            "fallback_link_count": fallback_count,
+            "skipped_count": skipped_count,
             "dispatches": results,
         }

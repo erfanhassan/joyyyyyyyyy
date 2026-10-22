@@ -13,7 +13,16 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from app.core.config import settings
 
-SENSITIVE = ("token", "secret", "password", "authorization", "consumer_key", "api_key")
+SENSITIVE = (
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "consumer_key",
+    "api_key",
+    "webhook_url",
+    "sheet_url",
+)
 
 
 def redact(value):
@@ -38,6 +47,19 @@ def seal_credentials(value):
         return result
     if isinstance(value, list):
         return [seal_credentials(item) for item in value]
+    return value
+
+
+def open_credentials(value):
+    """Decrypt fields previously sealed by seal_credentials, preserving other values."""
+    from app.core.security import decrypt_token
+
+    if isinstance(value, dict):
+        return {key: open_credentials(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [open_credentials(item) for item in value]
+    if isinstance(value, str) and value.startswith("enc:"):
+        return decrypt_token(value[4:])
     return value
 
 

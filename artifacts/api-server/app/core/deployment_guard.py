@@ -46,6 +46,13 @@ def is_public_route(path: str, method: str) -> bool:
                 settings.META_VERIFY_TOKEN
                 and settings.META_VERIFY_TOKEN != "joy_meta_verify_token_default"
             )
+        if provider == "telephony":
+            endpoint = path[len(prefix) + len("telephony/"):]
+            return (
+                method == "POST"
+                and endpoint in ("completion", "livekit")
+                and bool(settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET)
+            )
         if provider in ("shopify", "woocommerce"):
             return method == "POST"  # Each store verifies its own signed secret.
         if provider == "meta-privacy":
@@ -53,6 +60,10 @@ def is_public_route(path: str, method: str) -> bool:
                 return True
             return method == "POST" and path.rsplit("/",1)[-1] in ("delete","deauthorize") and bool(settings.META_APP_SECRET)
         return method == "POST" and bool(secrets.get(provider))
+    if path == "/api/v1/telephony/verify-order":
+        return method == "GET" and len(settings.ENCRYPTION_KEY_SECRET) >= 32
+    if path == "/api/v1/telephony/verify-order/confirm":
+        return method == "POST" and len(settings.ENCRYPTION_KEY_SECRET) >= 32
     return False
 
 
