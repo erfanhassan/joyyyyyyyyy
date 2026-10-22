@@ -50,7 +50,7 @@ def is_public_route(path: str, method: str) -> bool:
             endpoint = path[len(prefix) + len("telephony/"):]
             return (
                 method == "POST"
-                and endpoint in ("completion", "livekit")
+                and endpoint == "livekit"
                 and bool(settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET)
             )
         if provider in ("shopify", "woocommerce"):

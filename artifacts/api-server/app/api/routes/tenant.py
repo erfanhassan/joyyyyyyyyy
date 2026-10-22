@@ -842,11 +842,11 @@ async def test_integration_connection(
 # Telephony Diagnostics & Live Test Call
 # ==========================================
 class OutboundCallRequest(BaseModel):
-    customer_phone: str = Field(min_length=7, max_length=25, pattern=r"^\+?[0-9][0-9\s().-]{6,24}$")
-    customer_name: str = Field(min_length=1, max_length=255)
-    shipping_address: str = Field(min_length=1, max_length=1000)
-    order_items: str = Field(min_length=1, max_length=1000)
-    order_total: float = Field(ge=0, le=99999999.99)
+    customer_phone: str = Field(default="+8801712345678", min_length=7, max_length=25, pattern=r"^\+?[0-9][0-9\s().-]{6,24}$")
+    customer_name: str = Field(default="Tahmid Rahman", min_length=1, max_length=255)
+    shipping_address: str = Field(default="House 42, Road 11, Banani, Dhaka", min_length=1, max_length=1000)
+    order_items: str = Field(default="Silk Jamdani Panjabi (Size L)", min_length=1, max_length=1000)
+    order_total: float = Field(default=3850.00, ge=0, le=99999999.99)
 
 
 class GoogleSheetSyncRequest(BaseModel):
